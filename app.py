@@ -1,3 +1,4 @@
+
 """
 Plant Maintenance Manager V14
 Single-file Streamlit app using generated work teams instead of fixed team membership.
@@ -63,19 +64,19 @@ div[data-testid="stDataFrame"] {
 </style>
 """, unsafe_allow_html=True)
 
-st.title("Plant Maintenance Manager V14")
-st.caption("Generated Teams • Editable Draft Schedule • Final Schedule • History • Cloud DB ready")
-if DB_BACKEND == "postgres":
-    st.success("Connected to persistent cloud database.")
-else:
-    st.info("Using local SQLite database. Add DATABASE_URL in Streamlit secrets to persist data in the cloud.")
-
 # ---------------------------------------------------------
 # CONSTANTS
 # ---------------------------------------------------------
 DB_PATH = "maintenance.db"
 DATABASE_URL = st.secrets.get("DATABASE_URL", os.getenv("DATABASE_URL", "")).strip()
 DB_BACKEND = "postgres" if DATABASE_URL else "sqlite"
+
+st.title("Plant Maintenance Manager V14")
+st.caption("Generated Teams • Editable Draft Schedule • Final Schedule • History • Cloud DB ready")
+if DB_BACKEND == "postgres":
+    st.success("Connected to persistent cloud database.")
+else:
+    st.info("Using local SQLite database. Add DATABASE_URL in Streamlit secrets to persist data in the cloud.")
 
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 PRIORITY_CLASSES = [
