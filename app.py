@@ -1,4 +1,3 @@
-
 """
 Plant Maintenance Manager V14
 Single-file Streamlit app using generated work teams instead of fixed team membership.
@@ -9,6 +8,8 @@ Run:
 
 from __future__ import annotations
 
+import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from io import BytesIO
@@ -16,6 +17,13 @@ from typing import Optional
 
 import pandas as pd
 import streamlit as st
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except Exception:  # pragma: no cover
+    psycopg = None
+    dict_row = None
 
 # ---------------------------------------------------------
 # PAGE CONFIG
@@ -56,12 +64,18 @@ div[data-testid="stDataFrame"] {
 """, unsafe_allow_html=True)
 
 st.title("Plant Maintenance Manager V14")
-st.caption("Generated Teams • Editable Draft Schedule • Final Schedule • History")
+st.caption("Generated Teams • Editable Draft Schedule • Final Schedule • History • Cloud DB ready")
+if DB_BACKEND == "postgres":
+    st.success("Connected to persistent cloud database.")
+else:
+    st.info("Using local SQLite database. Add DATABASE_URL in Streamlit secrets to persist data in the cloud.")
 
 # ---------------------------------------------------------
 # CONSTANTS
 # ---------------------------------------------------------
 DB_PATH = "maintenance.db"
+DATABASE_URL = st.secrets.get("DATABASE_URL", os.getenv("DATABASE_URL", "")).strip()
+DB_BACKEND = "postgres" if DATABASE_URL else "sqlite"
 
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 PRIORITY_CLASSES = [
@@ -98,13 +112,57 @@ DEFAULT_TECHS = [
 # ---------------------------------------------------------
 # DB HELPERS
 # ---------------------------------------------------------
+class DBConnWrapper:
+    def __init__(self, raw_conn, backend: str):
+        self.raw_conn = raw_conn
+        self.backend = backend
+
+    def _translate_query(self, query: str):
+        if self.backend != "postgres":
+            return query
+        query = re.sub(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)", r"%(\1)s", query)
+        query = query.replace("?", "%s")
+        return query
+
+    def execute(self, query, params=None):
+        query = self._translate_query(query)
+        if params is None:
+            return self.raw_conn.execute(query)
+        return self.raw_conn.execute(query, params)
+
+    def executemany(self, query, seq_of_params):
+        query = self._translate_query(query)
+        return self.raw_conn.executemany(query, seq_of_params)
+
+    def commit(self):
+        return self.raw_conn.commit()
+
+    def rollback(self):
+        return self.raw_conn.rollback()
+
+    def close(self):
+        return self.raw_conn.close()
+
+    def __getattr__(self, item):
+        return getattr(self.raw_conn, item)
+
+
 @contextmanager
 def get_connection():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.execute("PRAGMA journal_mode = WAL;")
-    conn.execute("PRAGMA busy_timeout = 30000;")
+    if DB_BACKEND == "postgres":
+        if psycopg is None:
+            raise RuntimeError(
+                "DATABASE_URL is set but psycopg is not installed. Add psycopg[binary] to requirements.txt."
+            )
+        raw = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        conn = DBConnWrapper(raw, "postgres")
+    else:
+        raw = sqlite3.connect(DB_PATH, timeout=30)
+        raw.row_factory = sqlite3.Row
+        raw.execute("PRAGMA foreign_keys = ON;")
+        raw.execute("PRAGMA journal_mode = WAL;")
+        raw.execute("PRAGMA busy_timeout = 30000;")
+        conn = DBConnWrapper(raw, "sqlite")
     try:
         yield conn
         conn.commit()
@@ -115,7 +173,19 @@ def get_connection():
         conn.close()
 
 
-def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+def table_exists(conn, table_name: str) -> bool:
+    if DB_BACKEND == "postgres":
+        row = conn.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = ?
+            ) AS exists
+            """,
+            (table_name,),
+        ).fetchone()
+        return bool(row["exists"] if isinstance(row, dict) else row[0])
     row = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
         (table_name,)
@@ -123,14 +193,33 @@ def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     return row is not None
 
 
-def column_exists(conn: sqlite3.Connection, table_name: str, column_name: str) -> bool:
+def get_columns(conn, table_name: str):
+    if DB_BACKEND == "postgres":
+        rows = conn.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = ?
+            ORDER BY ordinal_position
+            """,
+            (table_name,),
+        ).fetchall()
+        return [r["column_name"] if isinstance(r, dict) else r[0] for r in rows]
     cols = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-    return any(col["name"] == column_name for col in cols)
+    return [col["name"] for col in cols]
 
 
-def add_column_if_missing(conn: sqlite3.Connection, table_name: str, col_name: str, col_def: str):
+def column_exists(conn, table_name: str, column_name: str) -> bool:
+    return column_name in get_columns(conn, table_name)
+
+
+def add_column_if_missing(conn, table_name: str, col_name: str, col_def: str):
     if not column_exists(conn, table_name, col_name):
         conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_def}")
+
+
+def id_pk_sql() -> str:
+    return "INTEGER PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY" if DB_BACKEND == "postgres" else "INTEGER PRIMARY KEY AUTOINCREMENT"
 
 
 def rows_to_df(rows) -> pd.DataFrame:
@@ -238,9 +327,9 @@ def initialize_database():
 
 def ensure_technicians_table(conn):
     if not table_exists(conn, "technicians"):
-        conn.execute("""
+        conn.execute(f"""
             CREATE TABLE technicians (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {id_pk_sql()},
                 technician TEXT NOT NULL UNIQUE,
                 skill TEXT NOT NULL,
                 weekly_hours REAL NOT NULL DEFAULT 40,
@@ -253,9 +342,9 @@ def ensure_technicians_table(conn):
 
 def ensure_jobs_table(conn):
     if not table_exists(conn, "jobs"):
-        conn.execute("""
+        conn.execute(f"""
             CREATE TABLE jobs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {id_pk_sql()},
                 job TEXT NOT NULL,
                 location TEXT,
                 department TEXT,
@@ -281,7 +370,7 @@ def ensure_jobs_table(conn):
         """)
         return
 
-    old_cols = [c["name"] for c in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+    old_cols = get_columns(conn, "jobs")
     if "hours" in old_cols and "duration_hours" not in old_cols:
         add_column_if_missing(conn, "jobs", "duration_hours", "REAL")
     add_column_if_missing(conn, "jobs", "crew_size_required", "INTEGER NOT NULL DEFAULT 1")
@@ -335,9 +424,9 @@ def ensure_jobs_table(conn):
 
 def ensure_schedule_assignments_table(conn):
     if not table_exists(conn, "schedule_assignments"):
-        conn.execute("""
+        conn.execute(f"""
             CREATE TABLE schedule_assignments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {id_pk_sql()},
                 job_id INTEGER,
                 source_type TEXT NOT NULL DEFAULT 'job',
                 source_reference_id INTEGER,
@@ -374,9 +463,9 @@ def ensure_schedule_assignments_table(conn):
 
 
 def ensure_schedule_history_table(conn):
-    conn.execute("""
+    conn.execute(f"""
         CREATE TABLE IF NOT EXISTS schedule_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {id_pk_sql()},
             assignment_id INTEGER NOT NULL,
             action_type TEXT NOT NULL,
             old_value TEXT,
@@ -420,7 +509,7 @@ def migrate_old_manual_schedule(conn):
     if not table_exists(conn, "manual_schedule"):
         return
     rows = conn.execute("SELECT * FROM manual_schedule").fetchall()
-    old_cols = [c["name"] for c in conn.execute("PRAGMA table_info(manual_schedule)").fetchall()]
+    old_cols = get_columns(conn, "manual_schedule")
     for row in rows:
         old_id = row["id"] if "id" in row.keys() else None
         if old_id is None:
@@ -1211,7 +1300,40 @@ def build_job_import_template_bytes():
     return output.getvalue()
 
 
+def safe_int_import(value, default=0):
+    try:
+        if pd.isna(value):
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def safe_float_import(value, default=0.0):
+    try:
+        if pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def clean_text_import(value, default=""):
+    if pd.isna(value):
+        return default
+    text = str(value).strip()
+    return default if text.lower() == 'nan' else text
+
+
 def import_jobs_v14(import_df: pd.DataFrame):
+    """
+    Bulletproof importer:
+    - handles blanks / NaN in numeric cells
+    - defaults invalid values safely
+    - skips unusable rows instead of crashing
+    - returns a row-level report
+    Returns: inserted_count, fatal_error, report_df
+    """
     df = import_df.copy()
     df.columns = [str(c).strip() for c in df.columns]
 
@@ -1227,74 +1349,108 @@ def import_jobs_v14(import_df: pd.DataFrame):
 
     missing = [c for c in required if c not in df.columns]
     if missing:
-        return 0, f"Missing columns: {', '.join(missing)}"
+        return 0, f"Missing columns: {', '.join(missing)}", pd.DataFrame()
 
     inserted = 0
+    report_rows = []
 
-    for _, row in df.iterrows():
-        job = str(row.get("Job", "")).strip()
-        if not job or job.lower() == 'nan':
+    for idx, row in df.iterrows():
+        excel_row = idx + 2
+        job = clean_text_import(row.get("Job", ""), "")
+
+        if not job:
+            report_rows.append({
+                "Excel Row": excel_row,
+                "Job": "",
+                "Result": "Skipped",
+                "Reason": "Blank job name",
+            })
             continue
 
-        try:
-            location = str(row.get("Location", "")).strip()
-            department = str(row.get("Department", "")).strip()
-            duration = float(pd.to_numeric(row.get("Duration Hours", 0), errors="coerce"))
-            mech = int(pd.to_numeric(row.get("Mechanical Manpower", 0), errors="coerce") or 0)
-            weld = int(pd.to_numeric(row.get("Welding Manpower", 0), errors="coerce") or 0)
-            priority_score = int(pd.to_numeric(row.get("Priority", 7), errors="coerce") or 7)
-        except Exception as e:
-            return inserted, f"Could not parse one or more values on row for job '{job}': {e}"
+        location = clean_text_import(row.get("Location", ""), "")
+        department = clean_text_import(row.get("Department", ""), "")
+        duration = safe_float_import(row.get("Duration Hours", 1.0), 1.0)
+        mech = safe_int_import(row.get("Mechanical Manpower", 0), 0)
+        weld = safe_int_import(row.get("Welding Manpower", 0), 0)
+        priority_score = safe_int_import(row.get("Priority", 7), 7)
+
+        row_warnings = []
 
         if duration <= 0:
-            continue
-        if mech == 0 and weld == 0:
-            continue
+            duration = 1.0
+            row_warnings.append("Duration Hours was blank/invalid; defaulted to 1.0")
+
+        if priority_score <= 0:
+            priority_score = 7
+            row_warnings.append("Priority was blank/invalid; defaulted to 7")
 
         crew_raw = row.get("Crew Size", mech + weld)
+        crew = safe_int_import(crew_raw, mech + weld)
+        if crew < max(mech + weld, 1):
+            crew = max(mech + weld, 1)
+            row_warnings.append("Crew Size adjusted to match manpower requirement")
+
+        allowed_days_raw = clean_text_import(row.get("Allowed Days", default_allowed_days(0)), default_allowed_days(0))
+        allowed_days_list = [d.strip() for d in allowed_days_raw.split(',') if d.strip() in DAYS]
+        if not allowed_days_list:
+            allowed_days_list = DAYS[:5]
+            row_warnings.append("Allowed Days was blank/invalid; defaulted to Monday-Friday")
+        allowed_days = ",".join(allowed_days_list)
+
+        preferred_day_raw = clean_text_import(row.get("Preferred Day", ""), "")
+        preferred_day = preferred_day_raw if preferred_day_raw in DAYS else None
+        if preferred_day_raw and preferred_day is None:
+            row_warnings.append("Preferred Day was invalid and ignored")
+
+        notes = clean_text_import(row.get("Notes", ""), "")
+
+        if mech == 0 and weld == 0:
+            report_rows.append({
+                "Excel Row": excel_row,
+                "Job": job,
+                "Result": "Skipped",
+                "Reason": "Mechanical Manpower and Welding Manpower were both 0 or blank",
+            })
+            continue
+
         try:
-            crew = int(pd.to_numeric(crew_raw, errors="coerce") or (mech + weld))
-        except Exception:
-            crew = mech + weld
-        crew = max(crew, mech + weld, 1)
+            insert_job_v13(
+                job=job,
+                location=location,
+                department=department,
+                duration_hours=duration,
+                mechanical_manpower=mech,
+                welding_manpower=weld,
+                crew_size_required=crew,
+                priority_class=map_score_to_priority_class(priority_score),
+                priority_score=priority_score,
+                allowed_days=allowed_days,
+                preferred_day=preferred_day,
+                earliest_start_day=None,
+                latest_finish_day=None,
+                weekend_allowed=1 if any(d in allowed_days_list for d in ["Saturday", "Sunday"]) else 0,
+                requires_shutdown=0,
+                fixed_day_job=1 if preferred_day and allowed_days == preferred_day else 0,
+                can_split_across_days=1,
+                status="Pending",
+                notes=notes,
+            )
+            inserted += 1
+            report_rows.append({
+                "Excel Row": excel_row,
+                "Job": job,
+                "Result": "Imported",
+                "Reason": "; ".join(row_warnings) if row_warnings else "OK",
+            })
+        except Exception as e:
+            report_rows.append({
+                "Excel Row": excel_row,
+                "Job": job,
+                "Result": "Failed",
+                "Reason": str(e),
+            })
 
-        allowed_days_raw = row.get("Allowed Days", default_allowed_days(0))
-        allowed_days = str(allowed_days_raw).strip() if pd.notna(allowed_days_raw) and str(allowed_days_raw).strip() else default_allowed_days(0)
-
-        preferred_day_raw = row.get("Preferred Day", None)
-        preferred_day = None
-        if pd.notna(preferred_day_raw):
-            preferred_day = str(preferred_day_raw).strip() or None
-            if preferred_day not in DAYS:
-                preferred_day = None
-
-        notes_raw = row.get("Notes", "")
-        notes = "" if pd.isna(notes_raw) else str(notes_raw)
-
-        insert_job_v13(
-            job=job,
-            location=location,
-            department=department,
-            duration_hours=duration,
-            mechanical_manpower=mech,
-            welding_manpower=weld,
-            crew_size_required=crew,
-            priority_class=map_score_to_priority_class(priority_score),
-            priority_score=priority_score,
-            allowed_days=allowed_days,
-            preferred_day=preferred_day,
-            earliest_start_day=None,
-            latest_finish_day=None,
-            weekend_allowed=1 if any(d in allowed_days for d in ["Saturday", "Sunday"]) else 0,
-            requires_shutdown=0,
-            fixed_day_job=1 if preferred_day and allowed_days == preferred_day else 0,
-            can_split_across_days=1,
-            status="Pending",
-            notes=notes,
-        )
-        inserted += 1
-
-    return inserted, None
+    return inserted, None, pd.DataFrame(report_rows)
 
 
 # ---------------------------------------------------------
@@ -2197,16 +2353,31 @@ with tab8:
             import_preview_df.columns = [str(c).strip() for c in import_preview_df.columns]
             st.write("Import Preview")
             st.dataframe(import_preview_df, use_container_width=True)
+            st.caption("Blank numeric cells are handled safely. Rows with no manpower are skipped and reported below.")
 
             if st.button("Import Jobs", use_container_width=True):
-                inserted, error = import_jobs_v14(import_preview_df)
+                inserted, error, import_report_df = import_jobs_v14(import_preview_df)
                 if error:
                     st.error(error)
                 else:
-                    st.success(f"{inserted} job(s) imported.")
+                    st.session_state["import_report_df"] = import_report_df
+                    imported_count = 0 if import_report_df.empty else int((import_report_df["Result"] == "Imported").sum())
+                    skipped_count = 0 if import_report_df.empty else int((import_report_df["Result"] == "Skipped").sum())
+                    failed_count = 0 if import_report_df.empty else int((import_report_df["Result"] == "Failed").sum())
+                    if imported_count > 0:
+                        st.success(f"{imported_count} job(s) imported.")
+                    if skipped_count > 0:
+                        st.warning(f"{skipped_count} row(s) were skipped.")
+                    if failed_count > 0:
+                        st.error(f"{failed_count} row(s) failed to import.")
                     st.rerun()
         except Exception as e:
             st.error(f"Could not read Excel file: {e}")
+
+    import_report_df = st.session_state.get("import_report_df", pd.DataFrame())
+    if isinstance(import_report_df, pd.DataFrame) and not import_report_df.empty:
+        st.markdown("##### Last Import Report")
+        st.dataframe(import_report_df, use_container_width=True)
 
     st.markdown("##### Export Data")
 
