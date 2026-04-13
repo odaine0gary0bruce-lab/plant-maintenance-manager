@@ -1045,6 +1045,76 @@ def build_generated_team_label(required_crew_size):
     return f"{crew} Man Team" if crew == 1 else f"{crew} Men Team"
 
 
+def technician_skill_counts(selected_names, technician_lookup):
+    selected = [technician_lookup.get(name) for name in selected_names if name in technician_lookup]
+    mech_count = sum(1 for t in selected if str(t["skill"]).strip().lower() == "mechanical")
+    weld_count = sum(1 for t in selected if str(t["skill"]).strip().lower() == "welding")
+    return mech_count, weld_count
+
+
+def crew_meets_job_requirements(selected_names, technician_lookup, mech_needed, weld_needed, crew_required):
+    if len(selected_names) < int(crew_required or 1):
+        return False
+    mech_count, weld_count = technician_skill_counts(selected_names, technician_lookup)
+    return mech_count >= int(mech_needed or 0) and weld_count >= int(weld_needed or 0)
+
+
+def auto_select_crew_for_day(day, crew_required, mech_needed, weld_needed, technician_lookup, tech_daily, tech_weekly, day_hours_limit, existing_team=None):
+    required = int(crew_required or 1)
+    mech_needed = int(mech_needed or 0)
+    weld_needed = int(weld_needed or 0)
+
+    def has_capacity(name):
+        tech = technician_lookup.get(name)
+        if not tech:
+            return False
+        daily_left = float(day_hours_limit) - float(tech_daily.get((name, day), 0.0))
+        weekly_left = float(tech.get("weekly_hours") or 40) - float(tech_weekly.get(name, 0.0))
+        return daily_left > 0 and weekly_left > 0
+
+    if existing_team:
+        existing_clean = [n for n in existing_team if n in technician_lookup]
+        if crew_meets_job_requirements(existing_clean, technician_lookup, mech_needed, weld_needed, required) and all(has_capacity(n) for n in existing_clean[:required]):
+            return existing_clean[:required]
+
+    mechanics = [name for name, tech in technician_lookup.items() if str(tech["skill"]).strip().lower() == "mechanical" and int(tech.get("active", 1)) == 1 and has_capacity(name)]
+    welders = [name for name, tech in technician_lookup.items() if str(tech["skill"]).strip().lower() == "welding" and int(tech.get("active", 1)) == 1 and has_capacity(name)]
+    everyone = [name for name, tech in technician_lookup.items() if int(tech.get("active", 1)) == 1 and has_capacity(name)]
+
+    def sort_key(name):
+        return (
+            float(day_hours_limit) - float(tech_daily.get((name, day), 0.0)),
+            float(technician_lookup[name].get("weekly_hours") or 40) - float(tech_weekly.get(name, 0.0)),
+        )
+
+    mechanics = sorted(mechanics, key=sort_key, reverse=True)
+    welders = sorted(welders, key=sort_key, reverse=True)
+    everyone = sorted(everyone, key=sort_key, reverse=True)
+
+    crew = []
+    used = set()
+    for name in mechanics[:mech_needed]:
+        crew.append(name)
+        used.add(name)
+    for name in welders:
+        if len([n for n in crew if str(technician_lookup[n]["skill"]).strip().lower()=="welding"]) >= weld_needed:
+            break
+        if name not in used:
+            crew.append(name)
+            used.add(name)
+
+    for name in everyone:
+        if len(crew) >= required:
+            break
+        if name not in used:
+            crew.append(name)
+            used.add(name)
+
+    if not crew_meets_job_requirements(crew, technician_lookup, mech_needed, weld_needed, required):
+        return []
+    return crew[:required]
+
+
 def get_skill_eligible_technicians(job_row, technician_lookup):
     mech_needed = int(job_row.get("mechanical_manpower", 0) or 0)
     weld_needed = int(job_row.get("welding_manpower", 0) or 0)
@@ -1112,11 +1182,11 @@ def validate_assignment_row(assignment_row, technician_lookup, existing_daily=No
 
 def generate_v14_draft_schedule(day_hours_limit=8.0, clear_existing=True):
     jobs_df = rows_to_df(fetch_all_jobs())
-    tech_lookup = get_technician_lookup(active_only=True)
+    technician_lookup = get_technician_lookup(active_only=True)
 
     if jobs_df.empty:
         return [], ["No jobs available to schedule."]
-    if not tech_lookup:
+    if not technician_lookup:
         return [], ["No active technicians available."]
 
     if clear_existing:
@@ -1133,13 +1203,8 @@ def generate_v14_draft_schedule(day_hours_limit=8.0, clear_existing=True):
     jobs_df["priority_rank"] = jobs_df["priority_class"].map(priority_order).fillna(99)
     jobs_df = jobs_df.sort_values(["priority_rank", "priority_score", "id"], ascending=[True, False, True]).reset_index(drop=True)
 
-    active_techs = list(tech_lookup.values())
-    mech_count = sum(1 for t in active_techs if str(t["skill"]).strip().lower() == "mechanical" and int(t["active"]) == 1)
-    weld_count = sum(1 for t in active_techs if str(t["skill"]).strip().lower() == "welding" and int(t["active"]) == 1)
-    total_count = sum(1 for t in active_techs if int(t["active"]) == 1)
-
-    used_mech_day, used_weld_day, used_total_day = get_existing_skill_hour_loads(include_draft=False, include_final=True)
-
+    tech_daily, tech_weekly = get_existing_assignment_loads(include_draft=False, include_final=True)
+    day_crews = {}
     notes = []
     generated = []
 
@@ -1160,36 +1225,40 @@ def generate_v14_draft_schedule(day_hours_limit=8.0, clear_existing=True):
         crew_required = int(job["crew_size_required"] or max(1, mech_needed + weld_needed))
         job_name = job["job"]
 
-        if mech_needed > mech_count or weld_needed > weld_count or crew_required > total_count:
-            notes.append(f"Job '{job_name}' could not be scheduled. Not enough active technicians for the required crew size/skill mix.")
-            continue
-
         valid_days = allowed_days.copy()
         if preferred_day and preferred_day in valid_days:
             valid_days = [preferred_day] + [d for d in valid_days if d != preferred_day]
-        if fixed_day:
+        if fixed_day and valid_days:
             valid_days = [preferred_day] if preferred_day else [valid_days[0]]
 
         progress_made = False
         while remaining_hours > 0:
             placed = False
             for day in valid_days:
-                mech_capacity = mech_count * float(day_hours_limit) - float(used_mech_day.get(day, 0.0))
-                weld_capacity = weld_count * float(day_hours_limit) - float(used_weld_day.get(day, 0.0))
-                total_capacity = total_count * float(day_hours_limit) - float(used_total_day.get(day, 0.0))
+                crew_key = (day, crew_required)
+                existing_team = day_crews.get(crew_key, [])
+                selected_team = auto_select_crew_for_day(
+                    day=day,
+                    crew_required=crew_required,
+                    mech_needed=mech_needed,
+                    weld_needed=weld_needed,
+                    technician_lookup=technician_lookup,
+                    tech_daily=tech_daily,
+                    tech_weekly=tech_weekly,
+                    day_hours_limit=day_hours_limit,
+                    existing_team=existing_team,
+                )
+                if not selected_team:
+                    continue
 
-                chunk_options = [remaining_hours, total_capacity / max(crew_required, 1)]
-                if mech_needed > 0:
-                    chunk_options.append(mech_capacity / mech_needed)
-                if weld_needed > 0:
-                    chunk_options.append(weld_capacity / weld_needed)
-
-                chunk = min(chunk_options)
-                chunk = round(float(chunk), 2)
+                day_left = min(float(day_hours_limit) - float(tech_daily.get((name, day), 0.0)) for name in selected_team)
+                week_left = min(float(technician_lookup[name].get("weekly_hours") or 40) - float(tech_weekly.get(name, 0.0)) for name in selected_team)
+                chunk = round(min(remaining_hours, day_left, week_left), 2)
                 if chunk <= 0:
                     continue
 
                 team_label = build_generated_team_label(crew_required)
+                assigned_technicians = ", ".join(selected_team)
                 insert_schedule_assignment(
                     job_id=int(job["id"]),
                     source_type="job",
@@ -1197,7 +1266,7 @@ def generate_v14_draft_schedule(day_hours_limit=8.0, clear_existing=True):
                     schedule_state="Draft",
                     day=day,
                     team_label=team_label,
-                    assigned_technicians="",
+                    assigned_technicians=assigned_technicians,
                     assigned_hours=chunk,
                     required_crew_size=crew_required,
                     mechanical_manpower=mech_needed,
@@ -1206,32 +1275,31 @@ def generate_v14_draft_schedule(day_hours_limit=8.0, clear_existing=True):
                     priority_score=int(job["priority_score"] or 8),
                     location=job["location"] or "",
                     department=job["department"] or "",
-                    notes="Auto-generated draft schedule. Select technicians for this crew.",
+                    notes="Auto-generated draft schedule. Technicians auto-assigned; you may adjust them.",
                     status="Scheduled",
                 )
 
-                used_mech_day[day] = float(used_mech_day.get(day, 0.0)) + mech_needed * chunk
-                used_weld_day[day] = float(used_weld_day.get(day, 0.0)) + weld_needed * chunk
-                used_total_day[day] = float(used_total_day.get(day, 0.0)) + crew_required * chunk
+                day_crews[crew_key] = selected_team
+                for name in selected_team:
+                    tech_daily[(name, day)] = tech_daily.get((name, day), 0.0) + chunk
+                    tech_weekly[name] = tech_weekly.get(name, 0.0) + chunk
 
                 generated.append({
                     "job_id": int(job["id"]),
                     "job": job_name,
                     "day": day,
                     "team_label": team_label,
-                    "assigned_technicians": "",
+                    "assigned_technicians": assigned_technicians,
                     "assigned_hours": chunk,
                 })
-
                 remaining_hours -= chunk
-                progress_made = True
                 placed = True
+                progress_made = True
 
                 if not can_split and remaining_hours > 0:
                     notes.append(f"Job '{job_name}' could not be fully scheduled because splitting across days is disabled.")
                     remaining_hours = 0
                     break
-
                 if remaining_hours <= 0:
                     break
 
@@ -1240,6 +1308,8 @@ def generate_v14_draft_schedule(day_hours_limit=8.0, clear_existing=True):
 
         if remaining_hours > 0:
             notes.append(f"Job '{job_name}' was only partially scheduled. {round(remaining_hours, 2)} hour(s) remain unscheduled.")
+        elif not progress_made:
+            notes.append(f"Job '{job_name}' could not be scheduled within current technician daily/weekly limits.")
 
     return generated, notes
 
@@ -1505,18 +1575,16 @@ draft_jobs_count = 0 if jobs_df.empty else int((jobs_df["status"] == "Draft Sche
 final_jobs_count = 0 if jobs_df.empty else int((jobs_df["status"] == "Final Scheduled").sum())
 active_jobs_count = 0 if jobs_df.empty else int((jobs_df["status"] == "Active").sum())
 completed_jobs_count = 0 if jobs_df.empty else int((jobs_df["status"] == "Complete").sum())
-technician_count = 0 if technicians_df.empty else int((technicians_df["active"] == 1).sum() if "active" in technicians_df.columns else len(technicians_df))
 draft_hours = 0 if draft_df.empty else round(float(draft_df["assigned_hours"].sum()), 2)
 final_hours = 0 if final_df.empty else round(float(final_df["assigned_hours"].sum()), 2)
 
-m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
+m1, m2, m3, m4, m5, m6 = st.columns(6)
 m1.metric("Pending Jobs", pending_jobs_count)
 m2.metric("Draft Scheduled", draft_jobs_count)
 m3.metric("Final Scheduled", final_jobs_count)
 m4.metric("Active Jobs", active_jobs_count)
 m5.metric("Completed Jobs", completed_jobs_count)
-m6.metric("Active Technicians", technician_count)
-m7.metric("Draft Hours", draft_hours)
+m6.metric("Draft Hours", draft_hours)
 
 st.divider()
 
@@ -1556,9 +1624,6 @@ with tab1:
         priority_summary = jobs_df.groupby("priority_class", as_index=False).agg(Jobs=("id", "count"))
         st.dataframe(priority_summary, use_container_width=True)
 
-    if not technicians_df.empty:
-        st.markdown("##### Technicians")
-        st.dataframe(technicians_df, use_container_width=True)
 
 # ---------------------------------------------------------
 # JOBS / BACKLOG TAB
@@ -1891,39 +1956,63 @@ with tab3:
             "id", "day", "job", "team_label", "assigned_technicians", "assigned_hours",
             "required_crew_size", "priority_class", "priority_score", "status", "notes"
         ]].copy()
+        max_crew_slots = int(max(6, editable_draft_df["required_crew_size"].max())) if not editable_draft_df.empty else 6
+        for idx, (_, draft_row) in enumerate(editable_draft_df.iterrows(), start=1):
+            assigned_names = [x.strip() for x in str(draft_row["assigned_technicians"] or "").split(",") if x.strip()]
+            for slot in range(1, max_crew_slots + 1):
+                editable_draft_df.loc[editable_draft_df.index == editable_draft_df.index[idx-1], f"Technician {slot}"] = assigned_names[slot-1] if slot <= len(assigned_names) else ""
+
+        display_cols = [
+            "id", "day", "job", "team_label", "assigned_hours", "required_crew_size",
+            "priority_class", "priority_score", "status", "notes"
+        ] + [f"Technician {slot}" for slot in range(1, max_crew_slots + 1)]
+
+        column_config = {
+            "id": st.column_config.NumberColumn("ID", disabled=True),
+            "day": st.column_config.SelectboxColumn("Day", options=DAYS),
+            "job": st.column_config.TextColumn("Job", disabled=True),
+            "team_label": st.column_config.TextColumn("Team Label", disabled=True),
+            "assigned_hours": st.column_config.NumberColumn("Assigned Hours", min_value=0.5, step=0.5),
+            "required_crew_size": st.column_config.NumberColumn("Required Crew Size", min_value=1, step=1),
+            "priority_class": st.column_config.SelectboxColumn("Priority Class", options=PRIORITY_CLASSES),
+            "priority_score": st.column_config.NumberColumn("Priority Score", min_value=1, max_value=20, step=1),
+            "status": st.column_config.SelectboxColumn("Status", options=["Scheduled", "In Progress", "Deferred", "Complete"]),
+            "notes": st.column_config.TextColumn("Notes"),
+        }
+        tech_dropdown_options = [""] + tech_names
+        for slot in range(1, max_crew_slots + 1):
+            column_config[f"Technician {slot}"] = st.column_config.SelectboxColumn(f"Technician {slot}", options=tech_dropdown_options)
 
         editable_draft_df = st.data_editor(
-            editable_draft_df,
+            editable_draft_df[display_cols],
             use_container_width=True,
             num_rows="fixed",
-            key="draft_quick_table_editor_v14",
-            column_config={
-                "id": st.column_config.NumberColumn("ID", disabled=True),
-                "day": st.column_config.SelectboxColumn("Day", options=DAYS),
-                "job": st.column_config.TextColumn("Job", disabled=True),
-                "team_label": st.column_config.TextColumn("Team Label", disabled=True),
-                "assigned_technicians": st.column_config.TextColumn("Assigned Technicians"),
-                "assigned_hours": st.column_config.NumberColumn("Assigned Hours", min_value=0.5, step=0.5),
-                "required_crew_size": st.column_config.NumberColumn("Required Crew Size", min_value=1, step=1),
-                "priority_class": st.column_config.SelectboxColumn("Priority Class", options=PRIORITY_CLASSES),
-                "priority_score": st.column_config.NumberColumn("Priority Score", min_value=1, max_value=20, step=1),
-                "status": st.column_config.SelectboxColumn("Status", options=["Scheduled", "In Progress", "Deferred", "Complete"]),
-                "notes": st.column_config.TextColumn("Notes"),
-            }
+            key="draft_quick_table_editor_v15",
+            column_config=column_config,
         )
 
-        if st.button("Save Draft Table Changes", use_container_width=True, key="save_draft_table_changes_v14"):
-            existing_daily, existing_weekly = {}, {}
+        if st.button("Save Draft Table Changes", use_container_width=True, key="save_draft_table_changes_v15"):
             draft_errors = []
             saved = 0
             for _, row in editable_draft_df.iterrows():
                 try:
                     assignment_id = int(row["id"])
+                    required_crew_size = int(row["required_crew_size"] or 1)
+                    selected_names = []
+                    for slot in range(1, max_crew_slots + 1):
+                        name = str(row.get(f"Technician {slot}", "") or "").strip()
+                        if name and name not in selected_names:
+                            selected_names.append(name)
+                    assigned_technicians = ", ".join(selected_names[:required_crew_size])
+
+                    source_assignment = current_draft_df[current_draft_df["id"] == assignment_id].iloc[0]
                     temp_assignment = {
                         "day": str(row["day"] or "Monday"),
                         "assigned_hours": float(row["assigned_hours"] or 0),
-                        "required_crew_size": int(row["required_crew_size"] or 1),
-                        "assigned_technicians": str(row["assigned_technicians"] or ""),
+                        "required_crew_size": required_crew_size,
+                        "assigned_technicians": assigned_technicians,
+                        "mechanical_manpower": int(source_assignment["mechanical_manpower"] or 0),
+                        "welding_manpower": int(source_assignment["welding_manpower"] or 0),
                     }
                     row_daily, row_weekly = get_existing_assignment_loads(include_draft=True, include_final=True, exclude_assignment_id=assignment_id)
                     warnings = validate_assignment_row(
@@ -1941,9 +2030,9 @@ with tab3:
                     update_assignment(
                         assignment_id,
                         day=str(row["day"] or "Monday"),
-                        assigned_technicians=str(row["assigned_technicians"] or "").strip(),
+                        assigned_technicians=assigned_technicians,
                         assigned_hours=float(row["assigned_hours"] or 1.0),
-                        required_crew_size=int(row["required_crew_size"] or 1),
+                        required_crew_size=required_crew_size,
                         priority_class=str(row["priority_class"] or "Medium"),
                         priority_score=int(row["priority_score"] or 8),
                         notes=str(row["notes"] or ""),
