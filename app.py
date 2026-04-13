@@ -1720,17 +1720,21 @@ with tab2:
 
     st.markdown("##### Backlog / Job Register")
 
-    if jobs_df.empty:
-        st.info("No jobs found.")
+    backlog_jobs_df = jobs_df.copy()
+    if not backlog_jobs_df.empty:
+        backlog_jobs_df = backlog_jobs_df[backlog_jobs_df["status"] != "Complete"].copy()
+
+    if backlog_jobs_df.empty:
+        st.info("No active jobs found in backlog.")
     else:
         remaining_rows = []
-        for _, row in jobs_df.iterrows():
+        for _, row in backlog_jobs_df.iterrows():
             remaining_rows.append({
                 "id": row["id"],
                 "remaining_hours": round(compute_remaining_job_hours(int(row["id"])), 2)
             })
         remaining_df = pd.DataFrame(remaining_rows)
-        display_jobs = jobs_df.merge(remaining_df, on="id", how="left")
+        display_jobs = backlog_jobs_df.merge(remaining_df, on="id", how="left")
 
         f1, f2, f3 = st.columns(3)
         status_filter = f1.selectbox("Filter by Status", ["All"] + JOB_STATUS_OPTIONS)
@@ -2360,10 +2364,15 @@ with tab7:
 
         options = {f"{row['id']} - {row['job']}": int(row["id"]) for _, row in filtered_jobs.iterrows()}
         if options:
-            selected_label = st.selectbox("Select Completed Job to Reopen", list(options.keys()))
-            if st.button("Reopen Selected Job", use_container_width=True):
+            selected_label = st.selectbox("Select Completed Job", list(options.keys()))
+            cj_action1, cj_action2 = st.columns(2)
+            if cj_action1.button("Reopen Selected Job", use_container_width=True):
                 reopen_completed_job(options[selected_label])
                 st.success("Completed job reopened.")
+                st.rerun()
+            if cj_action2.button("Delete Selected Job", use_container_width=True, type="primary"):
+                delete_job_permanently(options[selected_label])
+                st.success("Completed job deleted permanently.")
                 st.rerun()
 
     st.markdown("##### Completed Assignment History")
