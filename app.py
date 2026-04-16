@@ -1,6 +1,6 @@
 
 """
-Plant Maintenance Manager V14
+Plant Maintenance Manager V16
 Single-file Streamlit app using generated work teams instead of fixed team membership.
 
 Run:
@@ -30,7 +30,7 @@ except Exception:  # pragma: no cover
 # ---------------------------------------------------------
 # PAGE CONFIG
 # ---------------------------------------------------------
-st.set_page_config(page_title="Plant Maintenance Manager V14", layout="wide")
+st.set_page_config(page_title="Plant Maintenance Manager V16", layout="wide")
 
 st.markdown("""
 <style>
@@ -72,7 +72,7 @@ DB_PATH = "maintenance.db"
 DATABASE_URL = st.secrets.get("DATABASE_URL", os.getenv("DATABASE_URL", "")).strip()
 DB_BACKEND = "postgres" if DATABASE_URL else "sqlite"
 
-st.title("Plant Maintenance Manager V14")
+st.title("Plant Maintenance Manager V16")
 st.caption("Generated Teams • Editable Draft Schedule • Final Schedule • History • Cloud DB ready")
 if DB_BACKEND == "postgres":
     st.success("Connected to persistent cloud database.")
@@ -322,8 +322,8 @@ def initialize_database():
 
         conn.execute("""
             INSERT INTO app_metadata(key, value)
-            VALUES('schema_version', '14')
-            ON CONFLICT(key) DO UPDATE SET value='14'
+            VALUES('schema_version', '16')
+            ON CONFLICT(key) DO UPDATE SET value='16'
         """)
 
 
@@ -1014,23 +1014,46 @@ def get_crew_daily_hours(schedule_state="Draft"):
 
 
 def fetch_crew_summary(schedule_state="Draft"):
+    """
+    Returns a crew-level summary and tolerates older databases that may not yet
+    have newer columns like team_label.
+    """
     with get_connection() as conn:
-        rows = conn.execute("""
+        cols = set(get_columns(conn, "schedule_assignments")) if table_exists(conn, "schedule_assignments") else set()
+        if not cols:
+            return []
+
+        team_label_expr = "COALESCE(sa.team_label, 'Unassigned Crew')" if "team_label" in cols else "'Unassigned Crew'"
+        required_crew_expr = "COALESCE(sa.required_crew_size, 1)" if "required_crew_size" in cols else "1"
+        mech_expr = "COALESCE(sa.mechanical_manpower, 0)" if "mechanical_manpower" in cols else "0"
+        weld_expr = "COALESCE(sa.welding_manpower, 0)" if "welding_manpower" in cols else "0"
+        tech_expr = "COALESCE(sa.assigned_technicians, '')" if "assigned_technicians" in cols else "''"
+        hours_expr = "COALESCE(sa.assigned_hours, 0)" if "assigned_hours" in cols else "0"
+
+        if table_exists(conn, "jobs") and "job_id" in cols:
+            jobs_expr = "GROUP_CONCAT(DISTINCT COALESCE(j.job, ''))"
+            join_sql = "LEFT JOIN jobs j ON sa.job_id = j.id"
+        else:
+            jobs_expr = "''"
+            join_sql = ""
+
+        query = f"""
             SELECT
-                day,
-                team_label,
-                required_crew_size,
-                MAX(mechanical_manpower) AS mechanical_manpower,
-                MAX(welding_manpower) AS welding_manpower,
-                GROUP_CONCAT(DISTINCT job) AS jobs,
-                MAX(assigned_technicians) AS assigned_technicians,
-                COALESCE(SUM(assigned_hours),0) AS total_hours,
+                sa.day AS day,
+                {team_label_expr} AS team_label,
+                {required_crew_expr} AS required_crew_size,
+                MAX({mech_expr}) AS mechanical_manpower,
+                MAX({weld_expr}) AS welding_manpower,
+                {jobs_expr} AS jobs,
+                MAX({tech_expr}) AS assigned_technicians,
+                COALESCE(SUM({hours_expr}),0) AS total_hours,
                 COUNT(*) AS assignment_rows
-            FROM schedule_assignments
-            WHERE schedule_state = ?
-            GROUP BY day, team_label, required_crew_size
+            FROM schedule_assignments sa
+            {join_sql}
+            WHERE sa.schedule_state = ?
+            GROUP BY sa.day, {team_label_expr}, {required_crew_expr}
             ORDER BY
-                CASE day
+                CASE sa.day
                     WHEN 'Monday' THEN 1
                     WHEN 'Tuesday' THEN 2
                     WHEN 'Wednesday' THEN 3
@@ -1041,7 +1064,8 @@ def fetch_crew_summary(schedule_state="Draft"):
                     ELSE 8
                 END,
                 team_label
-        """, (schedule_state,)).fetchall()
+        """
+        rows = conn.execute(query, (schedule_state,)).fetchall()
     return rows
 
 
