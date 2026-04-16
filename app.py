@@ -802,6 +802,27 @@ def delete_assignment(assignment_id):
         conn.execute("DELETE FROM schedule_assignments WHERE id=?", (int(assignment_id),))
 
 
+def delete_job_permanently(job_id):
+    """
+    Permanently deletes a job and all linked schedule/history rows.
+    Intended for use from History / Completed where the user explicitly wants removal.
+    """
+    with get_connection() as conn:
+        # Remove history linked to this job's assignments first
+        conn.execute("""
+            DELETE FROM schedule_history
+            WHERE assignment_id IN (
+                SELECT id FROM schedule_assignments WHERE job_id = ?
+            )
+        """, (int(job_id),))
+
+        # Remove linked schedule rows
+        conn.execute("DELETE FROM schedule_assignments WHERE job_id = ?", (int(job_id),))
+
+        # Remove the job itself
+        conn.execute("DELETE FROM jobs WHERE id = ?", (int(job_id),))
+
+
 def move_assignment_to_state(assignment_id, state):
     with get_connection() as conn:
         conn.execute("""
