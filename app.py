@@ -1,4 +1,3 @@
-
 """
 Plant Maintenance Manager V16
 Single-file Streamlit app using generated work teams instead of fixed team membership.
@@ -2111,7 +2110,7 @@ with tab3:
                     manual_status = st.selectbox("Status", ASSIGNMENT_STATUS_OPTIONS[:-1], index=0)
                     save_manual = st.form_submit_button("Add Manual Draft Assignment")
                     if save_manual:
-                    insert_schedule_assignment(
+                        insert_schedule_assignment(
                             job_id=int(selected_job["id"]),
                             source_type="job",
                             source_reference_id=int(selected_job["id"]),
