@@ -2183,7 +2183,7 @@ with tab3:
                         "mechanical_manpower": int(source_assignment["mechanical_manpower"] or 0),
                         "welding_manpower": int(source_assignment["welding_manpower"] or 0),
                     }
-                    row_daily, row_weekly = get_existing_assignment_loads(include_draft=True, include_final=True, exclude_assignment_id=assignment_id)
+                    row_daily, row_weekly, _ = get_existing_assignment_loads(include_draft=True, include_final=True, exclude_assignment_id=assignment_id)
                     warnings = validate_assignment_row(
                         temp_assignment,
                         technician_lookup,
@@ -2237,7 +2237,7 @@ with tab3:
             edit_status = ed4.selectbox("Status", ASSIGNMENT_STATUS_OPTIONS, index=ASSIGNMENT_STATUS_OPTIONS.index(selected_assignment["status"]) if selected_assignment["status"] in ASSIGNMENT_STATUS_OPTIONS else 0)
             edit_notes = st.text_area("Notes", value=selected_assignment["notes"] or "")
 
-            existing_daily, existing_weekly = get_existing_assignment_loads(include_draft=True, include_final=True, exclude_assignment_id=selected_id)
+            existing_daily, existing_weekly, _ = get_existing_assignment_loads(include_draft=True, include_final=True, exclude_assignment_id=selected_id)
             temp_assignment = {
                 "day": edit_day,
                 "assigned_hours": edit_hours,
