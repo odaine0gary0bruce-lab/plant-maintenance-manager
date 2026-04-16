@@ -2080,29 +2080,37 @@ with tab3:
     manual_jobs_df = rows_to_df(fetch_all_jobs())
     tech_names = sorted(list(technician_lookup.keys()))
     if not manual_jobs_df.empty and tech_names:
-        manual_job_options = {
-            f"{row['id']} - {row['job']}": int(row["id"])
-            for _, row in manual_jobs_df.iterrows()
-            if str(row["status"]).strip().lower() != "complete"
-        }
+        available_manual_jobs = manual_jobs_df[
+            manual_jobs_df["status"].fillna("").astype(str).str.strip().str.lower() != "complete"
+        ].copy()
 
         with st.expander("Manual Draft Assignment", expanded=False):
-            with st.form("manual_draft_assignment_form", clear_on_submit=True):
-                md1, md2 = st.columns(2)
-                sel_job_label = md1.selectbox("Job", list(manual_job_options.keys()))
-                sel_day = md2.selectbox("Day", DAYS)
-                selected_job_id = manual_job_options[sel_job_label]
-                selected_job = manual_jobs_df[manual_jobs_df["id"] == selected_job_id].iloc[0]
-                existing_draft_labels = rows_to_df(fetch_crew_summary("Draft"))
-                label_list = existing_draft_labels["team_label"].tolist() if not existing_draft_labels.empty else []
-                default_label = build_generated_team_label(int(selected_job["crew_size_required"] or 1), sel_day, next_crew_index_for_day(sel_day, label_list))
-                md1.text_input("Generated Team Label", value=default_label, disabled=True)
-                assigned_hours = md2.number_input("Assigned Hours", min_value=0.5, value=1.0, step=0.5)
-                assigned_techs = st.multiselect("Assigned Technicians", tech_names)
-                manual_notes = st.text_area("Notes")
-                manual_status = st.selectbox("Status", ASSIGNMENT_STATUS_OPTIONS[:-1], index=0)
-                save_manual = st.form_submit_button("Add Manual Draft Assignment")
-                if save_manual:
+            if available_manual_jobs.empty:
+                st.warning("No available jobs to assign.")
+            else:
+                available_manual_jobs["job_label"] = available_manual_jobs.apply(
+                    lambda r: f"{int(r['id'])} - {r['job']}", axis=1
+                )
+                with st.form("manual_draft_assignment_form", clear_on_submit=True):
+                    md1, md2 = st.columns(2)
+                    selected_job_id = md1.selectbox(
+                        "Job",
+                        options=available_manual_jobs["id"].astype(int).tolist(),
+                        format_func=lambda x: available_manual_jobs.loc[available_manual_jobs["id"] == x, "job_label"].iloc[0],
+                        key="manual_job_id_select_v16"
+                    )
+                    sel_day = md2.selectbox("Day", DAYS)
+                    selected_job = available_manual_jobs[available_manual_jobs["id"] == selected_job_id].iloc[0]
+                    existing_draft_labels = rows_to_df(fetch_crew_summary("Draft"))
+                    label_list = existing_draft_labels["team_label"].tolist() if not existing_draft_labels.empty else []
+                    default_label = build_generated_team_label(int(selected_job["crew_size_required"] or 1), sel_day, next_crew_index_for_day(sel_day, label_list))
+                    md1.text_input("Generated Team Label", value=default_label, disabled=True)
+                    assigned_hours = md2.number_input("Assigned Hours", min_value=0.5, value=1.0, step=0.5)
+                    assigned_techs = st.multiselect("Assigned Technicians", tech_names)
+                    manual_notes = st.text_area("Notes")
+                    manual_status = st.selectbox("Status", ASSIGNMENT_STATUS_OPTIONS[:-1], index=0)
+                    save_manual = st.form_submit_button("Add Manual Draft Assignment")
+                    if save_manual:
                     insert_schedule_assignment(
                             job_id=int(selected_job["id"]),
                             source_type="job",
@@ -2240,9 +2248,16 @@ with tab3:
                 st.success(f"Saved {saved} draft row(s).")
                 st.rerun()
 
-        assignment_options = {f"{row['id']} - {row['day']} - {row['job']}": int(row["id"]) for _, row in current_draft_df.iterrows()}
-        selected_label = st.selectbox("Select Draft Assignment", list(assignment_options.keys()), key="draft_select")
-        selected_id = assignment_options[selected_label]
+        current_draft_df = current_draft_df.copy()
+        current_draft_df["assignment_label"] = current_draft_df.apply(
+            lambda r: f"{int(r['id'])} - {r['day']} - {r['job']}", axis=1
+        )
+        selected_id = st.selectbox(
+            "Select Draft Assignment",
+            options=current_draft_df["id"].astype(int).tolist(),
+            format_func=lambda x: current_draft_df.loc[current_draft_df["id"] == x, "assignment_label"].iloc[0],
+            key="draft_select_v16"
+        )
         selected_assignment = current_draft_df[current_draft_df["id"] == selected_id].iloc[0]
         current_selected_techs = [x.strip() for x in str(selected_assignment["assigned_technicians"] or "").split(",") if x.strip()]
 
@@ -2403,13 +2418,19 @@ with tab5:
         ]], use_container_width=True)
 
         st.markdown("##### Crew Editor")
-        crew_options = {
-            f"{row['team_label']}": (row["day"], row["team_label"])
-            for _, row in crew_rows.iterrows()
-        }
-        selected_crew_label = st.selectbox("Select Crew", list(crew_options.keys()), key="crew_editor_select_v16")
-        selected_day, selected_team_label = crew_options[selected_crew_label]
-        selected_crew = crew_rows[(crew_rows["day"] == selected_day) & (crew_rows["team_label"] == selected_team_label)].iloc[0]
+        crew_rows = crew_rows.copy()
+        crew_rows["crew_select_label"] = crew_rows.apply(
+            lambda r: f"{r['team_label']} | {r['day']}", axis=1
+        )
+        selected_crew_id = st.selectbox(
+            "Select Crew",
+            options=crew_rows.index.tolist(),
+            format_func=lambda x: crew_rows.loc[x, "crew_select_label"],
+            key="crew_editor_select_v16"
+        )
+        selected_crew = crew_rows.loc[selected_crew_id]
+        selected_day = selected_crew["day"]
+        selected_team_label = selected_crew["team_label"]
         required_crew = int(selected_crew["required_crew_size"] or 1)
         current_names = [x.strip() for x in str(selected_crew["assigned_technicians"] or "").split(",") if x.strip()]
 
