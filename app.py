@@ -1,3 +1,4 @@
+
 """
 Plant Maintenance Manager V16
 Single-file Streamlit app using generated work teams instead of fixed team membership.
@@ -2061,13 +2062,16 @@ with tab3:
     clear_old = g2.checkbox("Clear Existing Draft Before Generate", value=True)
 
     if st.button("Generate Draft Schedule", use_container_width=True):
-        generated, notes = generate_v14_draft_schedule(day_hours_limit=float(day_hours_limit), clear_existing=clear_old)
-        st.session_state["generation_notes"] = notes
-        if generated:
-            st.success(f"Generated {len(generated)} draft assignment row(s).")
-        else:
-            st.warning("No draft schedule rows were generated.")
-        st.rerun()
+        try:
+            generated, notes = generate_v14_draft_schedule(day_hours_limit=float(day_hours_limit), clear_existing=clear_old)
+            st.session_state["generation_notes"] = notes
+            if generated:
+                st.success(f"Generated {len(generated)} draft assignment row(s).")
+            else:
+                st.warning("No draft schedule rows were generated.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Draft generation failed: {e}")
 
     if "generation_notes" in st.session_state and st.session_state["generation_notes"]:
         with st.expander("Generation Notes / Warnings", expanded=False):
@@ -2129,8 +2133,8 @@ with tab3:
                             notes=manual_notes,
                             status=manual_status,
                         )
-                    st.success("Manual draft assignment added.")
-                    st.rerun()
+                        st.success("Manual draft assignment added.")
+                        st.rerun()
 
     st.markdown("##### Current Draft Schedule")
     if current_draft_df.empty:
