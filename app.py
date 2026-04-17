@@ -1359,6 +1359,45 @@ def generate_v14_draft_schedule(day_hours_limit=8.0, clear_existing=True):
     day_crews = {}
     notes = []
     generated = []
+    last_crew_for_priority = {}
+
+    def evaluate_crew_capacity(crew_obj, day, remaining_hours):
+        members = crew_obj["members"]
+        crew_hours_used = float(crew_obj["hours"])
+        if crew_hours_used >= float(day_hours_limit):
+            return 0.0
+        day_left = min(float(day_hours_limit) - float(tech_daily.get((name, day), 0.0)) for name in members)
+        week_left = min(float(technician_lookup[name].get("weekly_hours") or 40) - float(tech_weekly.get(name, 0.0)) for name in members)
+        crew_left = float(day_hours_limit) - crew_hours_used
+        return round(min(remaining_hours, day_left, week_left, crew_left), 2)
+
+    def create_new_crew(day, crew_required, mech_needed, weld_needed, crews_for_key):
+        selected_team = auto_select_crew_for_day(
+            day=day,
+            crew_required=crew_required,
+            mech_needed=mech_needed,
+            weld_needed=weld_needed,
+            technician_lookup=technician_lookup,
+            tech_daily=tech_daily,
+            tech_weekly=tech_weekly,
+            tech_day_team=tech_day_team,
+            day_hours_limit=day_hours_limit,
+            existing_team=None,
+        )
+        if not selected_team:
+            return None, 0.0
+        existing_labels = [c["label"] for c in crews_for_key]
+        crew_index = next_crew_index_for_day(day, existing_labels)
+        crew_obj = {
+            "label": build_generated_team_label(crew_required, day, crew_index),
+            "members": selected_team,
+            "hours": 0.0,
+            "crew_index": crew_index,
+        }
+        crews_for_key.append(crew_obj)
+        for name in selected_team:
+            tech_day_team[(name, day)] = crew_obj["label"]
+        return crew_obj, evaluate_crew_capacity(crew_obj, day, remaining_hours)
 
     for _, job in jobs_df.iterrows():
         if str(job["status"]).strip().lower() == "complete":
@@ -1376,6 +1415,8 @@ def generate_v14_draft_schedule(day_hours_limit=8.0, clear_existing=True):
         weld_needed = int(job["welding_manpower"] or 0)
         crew_required = int(job["crew_size_required"] or max(1, mech_needed + weld_needed))
         job_name = job["job"]
+        priority_rank = int(job["priority_rank"])
+        priority_score = int(job["priority_score"] or 8)
 
         valid_days = allowed_days.copy()
         if preferred_day and preferred_day in valid_days:
@@ -1388,52 +1429,42 @@ def generate_v14_draft_schedule(day_hours_limit=8.0, clear_existing=True):
             placed = False
             for day in valid_days:
                 crews_for_key = day_crews.setdefault((day, crew_required), [])
+                priority_key = (day, crew_required, priority_rank, priority_score)
+                last_used_label = last_crew_for_priority.get(priority_key)
+
                 candidate_crew = None
                 candidate_chunk = 0.0
 
+                alternative_existing = []
+                same_existing = []
                 for crew_obj in crews_for_key:
                     members = crew_obj["members"]
-                    crew_hours_used = float(crew_obj["hours"])
-                    if crew_hours_used >= float(day_hours_limit):
-                        continue
                     if not crew_meets_job_requirements(members, technician_lookup, mech_needed, weld_needed, crew_required):
                         continue
-                    day_left = min(float(day_hours_limit) - float(tech_daily.get((name, day), 0.0)) for name in members)
-                    week_left = min(float(technician_lookup[name].get("weekly_hours") or 40) - float(tech_weekly.get(name, 0.0)) for name in members)
-                    crew_left = float(day_hours_limit) - crew_hours_used
-                    chunk = round(min(remaining_hours, day_left, week_left, crew_left), 2)
-                    if chunk > candidate_chunk:
-                        candidate_chunk = chunk
-                        candidate_crew = crew_obj
+                    chunk = evaluate_crew_capacity(crew_obj, day, remaining_hours)
+                    if chunk <= 0:
+                        continue
+                    if last_used_label and crew_obj["label"] == last_used_label:
+                        same_existing.append((chunk, crew_obj))
+                    else:
+                        alternative_existing.append((chunk, crew_obj))
 
-                if candidate_crew is None:
-                    selected_team = auto_select_crew_for_day(
-                        day=day,
-                        crew_required=crew_required,
-                        mech_needed=mech_needed,
-                        weld_needed=weld_needed,
-                        technician_lookup=technician_lookup,
-                        tech_daily=tech_daily,
-                        tech_weekly=tech_weekly,
-                        tech_day_team=tech_day_team,
-                        day_hours_limit=day_hours_limit,
-                        existing_team=None,
-                    )
-                    if selected_team:
-                        existing_labels = [c["label"] for c in crews_for_key]
-                        crew_index = next_crew_index_for_day(day, existing_labels)
-                        candidate_crew = {
-                            "label": build_generated_team_label(crew_required, day, crew_index),
-                            "members": selected_team,
-                            "hours": 0.0,
-                            "crew_index": crew_index,
-                        }
-                        crews_for_key.append(candidate_crew)
-                        for name in selected_team:
-                            tech_day_team[(name, day)] = candidate_crew["label"]
-                        day_left = min(float(day_hours_limit) - float(tech_daily.get((name, day), 0.0)) for name in selected_team)
-                        week_left = min(float(technician_lookup[name].get("weekly_hours") or 40) - float(tech_weekly.get(name, 0.0)) for name in selected_team)
-                        candidate_chunk = round(min(remaining_hours, day_left, week_left, float(day_hours_limit)), 2)
+                if alternative_existing:
+                    alternative_existing.sort(key=lambda x: (x[0], -float(x[1]["hours"])), reverse=True)
+                    candidate_chunk, candidate_crew = alternative_existing[0]
+                elif last_used_label:
+                    # Equal-priority tie: try to create a fresh crew before reusing the same one.
+                    candidate_crew, candidate_chunk = create_new_crew(day, crew_required, mech_needed, weld_needed, crews_for_key)
+                    if candidate_crew is None and same_existing:
+                        same_existing.sort(key=lambda x: (x[0], -float(x[1]["hours"])), reverse=True)
+                        candidate_chunk, candidate_crew = same_existing[0]
+                else:
+                    # No previous equal-priority crew on this day/size yet.
+                    if same_existing:
+                        same_existing.sort(key=lambda x: (x[0], -float(x[1]["hours"])), reverse=True)
+                        candidate_chunk, candidate_crew = same_existing[0]
+                    else:
+                        candidate_crew, candidate_chunk = create_new_crew(day, crew_required, mech_needed, weld_needed, crews_for_key)
 
                 if candidate_crew is None or candidate_chunk <= 0:
                     continue
@@ -1444,7 +1475,7 @@ def generate_v14_draft_schedule(day_hours_limit=8.0, clear_existing=True):
                     assigned_hours=candidate_chunk,
                     required_crew_size=crew_required,
                     priority_class=job["priority_class"],
-                    priority_score=int(job["priority_score"] or 8),
+                    priority_score=priority_score,
                     schedule_state="Draft",
                     job_id=int(job["id"]),
                     team_label=candidate_crew["label"],
@@ -1464,6 +1495,7 @@ def generate_v14_draft_schedule(day_hours_limit=8.0, clear_existing=True):
                     tech_weekly[tech_name] = tech_weekly.get(tech_name, 0.0) + candidate_chunk
                     tech_day_team[(tech_name, day)] = candidate_crew["label"]
                 candidate_crew["hours"] += candidate_chunk
+                last_crew_for_priority[priority_key] = candidate_crew["label"]
 
                 generated.append({
                     "job_id": int(job["id"]),
