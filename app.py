@@ -15,6 +15,7 @@ import string
 import sqlite3
 from contextlib import contextmanager
 from io import BytesIO
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
@@ -68,7 +69,9 @@ div[data-testid="stDataFrame"] {
 # ---------------------------------------------------------
 # CONSTANTS
 # ---------------------------------------------------------
-DB_PATH = "maintenance.db"
+DATA_DIR = Path(st.secrets.get("DATA_DIR", os.getenv("MAINTENANCE_DATA_DIR", "data"))).expanduser()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = str(DATA_DIR / "maintenance.db")
 DATABASE_URL = st.secrets.get("DATABASE_URL", os.getenv("DATABASE_URL", "")).strip()
 DB_BACKEND = "postgres" if DATABASE_URL else "sqlite"
 
@@ -77,7 +80,7 @@ st.caption("Generated Teams • Editable Draft Schedule • Final Schedule • H
 if DB_BACKEND == "postgres":
     st.success("Connected to persistent cloud database.")
 else:
-    st.info("Using local SQLite database. Add DATABASE_URL in Streamlit secrets to persist data in the cloud.")
+    st.info(f"Jobs are saved in the persistent SQLite file: {Path(DB_PATH).resolve()}")
 
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 PRIORITY_CLASSES = [
@@ -88,6 +91,12 @@ PRIORITY_CLASSES = [
     "Low",
     "Opportunity / Shutdown",
 ]
+SIMPLE_PRIORITIES = {
+    "Critical — act immediately": ("Emergency", 18),
+    "High — schedule next": ("High", 12),
+    "Normal — routine work": ("Medium", 7),
+    "Low — when time allows": ("Low", 3),
+}
 JOB_STATUS_OPTIONS = [
     "Pending",
     "Draft Scheduled",
@@ -312,6 +321,7 @@ def initialize_database():
         """)
 
         ensure_technicians_table(conn)
+        ensure_assets_table(conn)
         ensure_jobs_table(conn)
         ensure_schedule_assignments_table(conn)
         ensure_schedule_history_table(conn)
@@ -322,8 +332,8 @@ def initialize_database():
 
         conn.execute("""
             INSERT INTO app_metadata(key, value)
-            VALUES('schema_version', '16')
-            ON CONFLICT(key) DO UPDATE SET value='16'
+        VALUES('schema_version', '17')
+            ON CONFLICT(key) DO UPDATE SET value='17'
         """)
 
 
@@ -342,11 +352,30 @@ def ensure_technicians_table(conn):
         add_column_if_missing(conn, "technicians", "active", "INTEGER NOT NULL DEFAULT 1")
 
 
+def ensure_assets_table(conn):
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS assets (
+            id {id_pk_sql()},
+            asset_number TEXT NOT NULL UNIQUE,
+            asset_name TEXT NOT NULL,
+            location TEXT,
+            department TEXT,
+            criticality TEXT NOT NULL DEFAULT 'Normal',
+            manufacturer TEXT,
+            model TEXT,
+            active INTEGER NOT NULL DEFAULT 1,
+            notes TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+
 def ensure_jobs_table(conn):
     if not table_exists(conn, "jobs"):
         conn.execute(f"""
             CREATE TABLE jobs (
                 id {id_pk_sql()},
+                asset_id INTEGER,
                 job TEXT NOT NULL,
                 location TEXT,
                 department TEXT,
@@ -368,11 +397,18 @@ def ensure_jobs_table(conn):
                 notes TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 completed_at TEXT
+                ,scope_ready INTEGER NOT NULL DEFAULT 1
+                ,parts_ready INTEGER NOT NULL DEFAULT 1
+                ,permits_ready INTEGER NOT NULL DEFAULT 1
+                ,shutdown_ready INTEGER NOT NULL DEFAULT 1
+                ,ready_to_schedule INTEGER NOT NULL DEFAULT 1
+                ,FOREIGN KEY (asset_id) REFERENCES assets(id) ON DELETE SET NULL
             )
         """)
         return
 
     old_cols = get_columns(conn, "jobs")
+    add_column_if_missing(conn, "jobs", "asset_id", "INTEGER")
     if "hours" in old_cols and "duration_hours" not in old_cols:
         add_column_if_missing(conn, "jobs", "duration_hours", "REAL")
     add_column_if_missing(conn, "jobs", "crew_size_required", "INTEGER NOT NULL DEFAULT 1")
@@ -389,6 +425,11 @@ def ensure_jobs_table(conn):
     add_column_if_missing(conn, "jobs", "notes", "TEXT")
     add_column_if_missing(conn, "jobs", "created_at", "TEXT")
     add_column_if_missing(conn, "jobs", "completed_at", "TEXT")
+    add_column_if_missing(conn, "jobs", "scope_ready", "INTEGER NOT NULL DEFAULT 1")
+    add_column_if_missing(conn, "jobs", "parts_ready", "INTEGER NOT NULL DEFAULT 1")
+    add_column_if_missing(conn, "jobs", "permits_ready", "INTEGER NOT NULL DEFAULT 1")
+    add_column_if_missing(conn, "jobs", "shutdown_ready", "INTEGER NOT NULL DEFAULT 1")
+    add_column_if_missing(conn, "jobs", "ready_to_schedule", "INTEGER NOT NULL DEFAULT 1")
 
     conn.execute("UPDATE jobs SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP) WHERE created_at IS NULL")
     if "hours" in old_cols:
@@ -607,18 +648,63 @@ def fetch_all_technicians(active_only=True):
         return conn.execute("SELECT * FROM technicians ORDER BY technician").fetchall()
 
 
+def fetch_all_assets(active_only=False):
+    with get_connection() as conn:
+        query = "SELECT * FROM assets"
+        if active_only:
+            query += " WHERE active=1"
+        query += " ORDER BY asset_number, asset_name"
+        return conn.execute(query).fetchall()
+
+
+def save_asset(**kwargs):
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO assets (
+                asset_number, asset_name, location, department, criticality,
+                manufacturer, model, active, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            kwargs["asset_number"].strip(), kwargs["asset_name"].strip(),
+            kwargs.get("location", "").strip(), kwargs.get("department", "").strip(),
+            kwargs.get("criticality", "Normal"), kwargs.get("manufacturer", "").strip(),
+            kwargs.get("model", "").strip(), int(kwargs.get("active", 1)),
+            kwargs.get("notes", "").strip(),
+        ))
+
+
+def update_job_readiness(job_id, scope_ready, parts_ready, permits_ready, shutdown_ready):
+    ready = int(bool(scope_ready and parts_ready and permits_ready and shutdown_ready))
+    with get_connection() as conn:
+        conn.execute("""
+            UPDATE jobs
+            SET scope_ready=?, parts_ready=?, permits_ready=?, shutdown_ready=?,
+                ready_to_schedule=?
+            WHERE id=?
+        """, (
+            int(scope_ready), int(parts_ready), int(permits_ready),
+            int(shutdown_ready), ready, int(job_id),
+        ))
+    return ready
+
+
 def insert_job_v13(**kwargs):
     with get_connection() as conn:
-        cur = conn.execute("""
+        insert_sql = """
             INSERT INTO jobs (
-                job, location, department, duration_hours,
+                asset_id, job, location, department, duration_hours,
                 mechanical_manpower, welding_manpower, crew_size_required,
                 priority_class, priority_score, allowed_days, preferred_day,
                 earliest_start_day, latest_finish_day, weekend_allowed,
                 requires_shutdown, fixed_day_job, can_split_across_days,
-                status, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
+                status, notes, scope_ready, parts_ready, permits_ready,
+                shutdown_ready, ready_to_schedule
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        if DB_BACKEND == "postgres":
+            insert_sql += " RETURNING id"
+        cur = conn.execute(insert_sql, (
+            kwargs.get("asset_id"),
             kwargs["job"].strip(),
             kwargs.get("location", "").strip(),
             kwargs.get("department", "").strip(),
@@ -638,7 +724,14 @@ def insert_job_v13(**kwargs):
             int(kwargs.get("can_split_across_days", 1)),
             kwargs.get("status", "Pending"),
             kwargs.get("notes", "").strip(),
+            int(kwargs.get("scope_ready", 1)),
+            int(kwargs.get("parts_ready", 1)),
+            int(kwargs.get("permits_ready", 1)),
+            int(kwargs.get("shutdown_ready", 1)),
+            int(kwargs.get("ready_to_schedule", 1)),
         ))
+        if DB_BACKEND == "postgres":
+            return cur.fetchone()["id"]
         return cur.lastrowid
 
 
@@ -712,14 +805,17 @@ def fetch_schedule_rows(schedule_state="Draft"):
 
 def insert_schedule_assignment(**kwargs):
     with get_connection() as conn:
-        cur = conn.execute("""
+        insert_sql = """
             INSERT INTO schedule_assignments (
                 job_id, source_type, source_reference_id, schedule_state, day,
                 team_label, assigned_technicians, assigned_hours, required_crew_size,
                 mechanical_manpower, welding_manpower, priority_class, priority_score,
                 location, department, notes, status
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
+        """
+        if DB_BACKEND == "postgres":
+            insert_sql += " RETURNING id"
+        cur = conn.execute(insert_sql, (
             kwargs.get("job_id"),
             kwargs.get("source_type", "job"),
             kwargs.get("source_reference_id"),
@@ -738,12 +834,34 @@ def insert_schedule_assignment(**kwargs):
             kwargs.get("notes", ""),
             kwargs.get("status", "Scheduled"),
         ))
+        job_id = kwargs.get("job_id")
+        schedule_state = kwargs.get("schedule_state", "Draft")
+        if job_id is not None and schedule_state in ("Draft", "Final"):
+            job_status = "Final Scheduled" if schedule_state == "Final" else "Draft Scheduled"
+            conn.execute("""
+                UPDATE jobs
+                SET status=?
+                WHERE id=? AND status <> 'Complete'
+            """, (job_status, int(job_id)))
+        if DB_BACKEND == "postgres":
+            return cur.fetchone()["id"]
         return cur.lastrowid
 
 
 def clear_draft_schedule():
     with get_connection() as conn:
         conn.execute("DELETE FROM schedule_assignments WHERE schedule_state='Draft'")
+        conn.execute("""
+            UPDATE jobs
+            SET status = CASE
+                WHEN id IN (
+                    SELECT DISTINCT job_id FROM schedule_assignments
+                    WHERE schedule_state='Final' AND job_id IS NOT NULL
+                ) THEN 'Final Scheduled'
+                ELSE 'Pending'
+            END
+            WHERE status='Draft Scheduled'
+        """)
 
 
 def update_assignment(assignment_id, **kwargs):
@@ -825,11 +943,30 @@ def delete_job_permanently(job_id):
 
 def move_assignment_to_state(assignment_id, state):
     with get_connection() as conn:
+        assignment = conn.execute(
+            "SELECT job_id FROM schedule_assignments WHERE id=?",
+            (int(assignment_id),),
+        ).fetchone()
+        if not assignment:
+            return
         conn.execute("""
             UPDATE schedule_assignments
             SET schedule_state=?, updated_at=CURRENT_TIMESTAMP
             WHERE id=?
         """, (state, int(assignment_id)))
+        job_id = assignment["job_id"]
+        if job_id is not None:
+            final_count = conn.execute("""
+                SELECT COUNT(*) AS c
+                FROM schedule_assignments
+                WHERE job_id=? AND schedule_state='Final'
+            """, (int(job_id),)).fetchone()["c"]
+            new_status = "Final Scheduled" if int(final_count) else "Draft Scheduled"
+            conn.execute("""
+                UPDATE jobs
+                SET status=?
+                WHERE id=? AND status <> 'Complete'
+            """, (new_status, int(job_id)))
 
 
 def promote_all_draft_to_final():
@@ -1052,7 +1189,11 @@ def fetch_crew_summary(schedule_state="Draft"):
         hours_expr = "COALESCE(sa.assigned_hours, 0)" if "assigned_hours" in cols else "0"
 
         if table_exists(conn, "jobs") and "job_id" in cols:
-            jobs_expr = "GROUP_CONCAT(DISTINCT COALESCE(j.job, ''))"
+            jobs_expr = (
+                "STRING_AGG(DISTINCT COALESCE(j.job, ''), ',')"
+                if DB_BACKEND == "postgres"
+                else "GROUP_CONCAT(DISTINCT COALESCE(j.job, ''))"
+            )
             join_sql = "LEFT JOIN jobs j ON sa.job_id = j.id"
         else:
             jobs_expr = "''"
@@ -1341,6 +1482,11 @@ def generate_v14_draft_schedule(day_hours_limit=8.0, clear_existing=True):
     if not technician_lookup:
         return [], ["No active technicians available."]
 
+    waiting_count = int((jobs_df["ready_to_schedule"].fillna(0).astype(int) != 1).sum())
+    jobs_df = jobs_df[jobs_df["ready_to_schedule"].fillna(0).astype(int) == 1].copy()
+    if jobs_df.empty:
+        return [], [f"No jobs are ready to schedule. {waiting_count} job(s) are waiting on readiness checks."]
+
     if clear_existing:
         clear_draft_schedule()
 
@@ -1358,6 +1504,8 @@ def generate_v14_draft_schedule(day_hours_limit=8.0, clear_existing=True):
     tech_daily, tech_weekly, tech_day_team = get_existing_assignment_loads(include_draft=False, include_final=True)
     day_crews = {}
     notes = []
+    if waiting_count:
+        notes.append(f"Skipped {waiting_count} job(s) that are not ready to schedule.")
     generated = []
     last_crew_for_priority = {}
 
@@ -1469,6 +1617,11 @@ def generate_v14_draft_schedule(day_hours_limit=8.0, clear_existing=True):
                 if candidate_crew is None or candidate_chunk <= 0:
                     continue
 
+                # A non-splittable job must fit in one assignment. Do not create
+                # a misleading partial row and discard its remaining duration.
+                if not can_split and candidate_chunk < remaining_hours:
+                    continue
+
                 assigned_technicians = ", ".join(candidate_crew["members"])
                 insert_schedule_assignment(
                     day=day,
@@ -1509,11 +1662,6 @@ def generate_v14_draft_schedule(day_hours_limit=8.0, clear_existing=True):
                 remaining_hours -= candidate_chunk
                 placed = True
                 progress_made = True
-
-                if not can_split and remaining_hours > 0:
-                    notes.append(f"Job '{job_name}' could not be fully scheduled because splitting across days is disabled.")
-                    remaining_hours = 0
-                    break
 
                 if remaining_hours <= 0:
                     break
@@ -1807,7 +1955,7 @@ st.divider()
 # ---------------------------------------------------------
 # TABS
 # ---------------------------------------------------------
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
     "Dashboard",
     "Jobs / Backlog",
     "Draft Schedule",
@@ -1816,6 +1964,9 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "Final Schedule",
     "History / Completed",
     "Import / Export",
+    "Planning / Readiness",
+    "Weekly Board",
+    "Assets",
 ])
 
 # ---------------------------------------------------------
@@ -1846,9 +1997,19 @@ with tab1:
 # ---------------------------------------------------------
 with tab2:
     st.subheader("Jobs / Backlog")
+    active_assets_df = rows_to_df(fetch_all_assets(active_only=True))
 
     with st.expander("Add New Job", expanded=False):
         with st.form("v14_add_job_form", clear_on_submit=True):
+            asset_options = [None] + (active_assets_df["id"].astype(int).tolist() if not active_assets_df.empty else [])
+            asset_id = st.selectbox(
+                "Asset / Equipment",
+                asset_options,
+                format_func=lambda x: "No asset selected" if x is None else (
+                    active_assets_df.loc[active_assets_df["id"] == x, "asset_number"].iloc[0]
+                    + " — " + active_assets_df.loc[active_assets_df["id"] == x, "asset_name"].iloc[0]
+                ),
+            )
             c1, c2 = st.columns(2)
             job_name = c1.text_input("Job Name")
             location = c2.text_input("Location / Equipment")
@@ -1860,29 +2021,13 @@ with tab2:
             crew_size_required = st.number_input("Crew Size Required", min_value=1, value=1, step=1)
 
             st.markdown("##### Priority")
-            priority_mode = st.radio("Priority Entry Method", ["Quick Select", "Score Based"], horizontal=True)
-
-            if priority_mode == "Quick Select":
-                priority_class = st.selectbox("Priority Class", PRIORITY_CLASSES, index=3)
-                default_score_map = {
-                    "Emergency": 18,
-                    "Urgent": 15,
-                    "High": 11,
-                    "Medium": 7,
-                    "Low": 3,
-                    "Opportunity / Shutdown": 6,
-                }
-                priority_score = default_score_map[priority_class]
-                st.caption(f"Priority Score will be saved as {priority_score}.")
-            else:
-                p1, p2, p3, p4 = st.columns(4)
-                safety = p1.selectbox("Safety Risk", [1, 2, 3, 4, 5], index=0)
-                production = p2.selectbox("Production Impact", [1, 2, 3, 4, 5], index=0)
-                criticality = p3.selectbox("Asset Criticality", [1, 2, 3, 4, 5], index=0)
-                delay_risk = p4.selectbox("Delay Risk", [1, 2, 3, 4, 5], index=0)
-                priority_score = calculate_priority_score(safety, production, criticality, delay_risk)
-                priority_class = map_score_to_priority_class(priority_score)
-                st.info(f"Calculated Priority: {priority_class} | Score: {priority_score}")
+            priority_choice = st.selectbox(
+                "How soon does this job need attention?",
+                options=list(SIMPLE_PRIORITIES.keys()),
+                index=2,
+                help="Choose one clear urgency level. The app handles scheduling order automatically.",
+            )
+            priority_class, priority_score = SIMPLE_PRIORITIES[priority_choice]
 
             st.markdown("##### Scheduling Rules")
             allowed_days = st.multiselect("Allowed Days", DAYS, default=DAYS[:5])
@@ -1895,6 +2040,15 @@ with tab2:
             requires_shutdown = cb2.checkbox("Requires Shutdown", value=False)
             fixed_day_job = cb3.checkbox("Fixed Day Job", value=False)
             can_split_across_days = cb4.checkbox("Can Split Across Days", value=True)
+
+            st.markdown("##### Ready to Schedule Checklist")
+            st.caption("The scheduler will only use jobs after every required item is confirmed.")
+            r1, r2, r3, r4 = st.columns(4)
+            scope_ready = r1.checkbox("Scope approved", value=False)
+            parts_ready = r2.checkbox("Parts available", value=False)
+            permits_ready = r3.checkbox("Permits / tools ready", value=False)
+            shutdown_ready = r4.checkbox("Access / shutdown ready", value=False)
+            ready_to_schedule = bool(scope_ready and parts_ready and permits_ready and shutdown_ready)
 
             status = st.selectbox("Status", JOB_STATUS_OPTIONS, index=0)
             notes = st.text_area("Notes")
@@ -1911,6 +2065,7 @@ with tab2:
                     st.error("Crew Size Required cannot be less than total manpower needed.")
                 else:
                     insert_job_v13(
+                        asset_id=asset_id,
                         job=job_name,
                         location=location,
                         department=department,
@@ -1930,6 +2085,11 @@ with tab2:
                         can_split_across_days=1 if can_split_across_days else 0,
                         status=status,
                         notes=notes,
+                        scope_ready=scope_ready,
+                        parts_ready=parts_ready,
+                        permits_ready=permits_ready,
+                        shutdown_ready=shutdown_ready,
+                        ready_to_schedule=ready_to_schedule,
                     )
                     st.success("Job saved.")
                     st.rerun()
@@ -2146,27 +2306,60 @@ with tab3:
                     manual_status = st.selectbox("Status", ASSIGNMENT_STATUS_OPTIONS[:-1], index=0)
                     save_manual = st.form_submit_button("Add Manual Draft Assignment")
                     if save_manual:
-                        insert_schedule_assignment(
-                            job_id=int(selected_job["id"]),
-                            source_type="job",
-                            source_reference_id=int(selected_job["id"]),
-                            schedule_state="Draft",
-                            day=sel_day,
-                            team_label=default_label,
-                            assigned_technicians=", ".join(assigned_techs),
-                            assigned_hours=float(assigned_hours),
-                            required_crew_size=int(selected_job["crew_size_required"] or 1),
-                            mechanical_manpower=int(selected_job["mechanical_manpower"] or 0),
-                            welding_manpower=int(selected_job["welding_manpower"] or 0),
-                            priority_class=selected_job["priority_class"],
-                            priority_score=int(selected_job["priority_score"] or 8),
-                            location=selected_job["location"] or "",
-                            department=selected_job["department"] or "",
-                            notes=manual_notes,
-                            status=manual_status,
+                        required_crew = int(selected_job["crew_size_required"] or 1)
+                        remaining = compute_remaining_job_hours(int(selected_job["id"]))
+                        allowed = parse_allowed_days(selected_job["allowed_days"])
+                        existing_daily, existing_weekly, _ = get_existing_assignment_loads(
+                            include_draft=True, include_final=True
                         )
-                        st.success("Manual draft assignment added.")
-                        st.rerun()
+                        candidate = {
+                            "day": sel_day,
+                            "assigned_hours": float(assigned_hours),
+                            "required_crew_size": required_crew,
+                            "assigned_technicians": ", ".join(assigned_techs),
+                            "mechanical_manpower": int(selected_job["mechanical_manpower"] or 0),
+                            "welding_manpower": int(selected_job["welding_manpower"] or 0),
+                        }
+                        errors = validate_assignment_row(
+                            candidate,
+                            technician_lookup,
+                            existing_daily=existing_daily,
+                            existing_weekly=existing_weekly,
+                            day_limit=float(day_hours_limit),
+                        )
+                        if not assigned_techs:
+                            errors.append("Select at least one technician.")
+                        if len(assigned_techs) != required_crew:
+                            errors.append(f"Select exactly {required_crew} technician(s).")
+                        if sel_day not in allowed:
+                            errors.append(f"{sel_day} is not an allowed day for this job.")
+                        if float(assigned_hours) > remaining:
+                            errors.append(f"Only {remaining:.2f} unscheduled job hour(s) remain.")
+
+                        if errors:
+                            st.error("Assignment was not added: " + " | ".join(dict.fromkeys(errors)))
+                        else:
+                            insert_schedule_assignment(
+                                job_id=int(selected_job["id"]),
+                                source_type="job",
+                                source_reference_id=int(selected_job["id"]),
+                                schedule_state="Draft",
+                                day=sel_day,
+                                team_label=default_label,
+                                assigned_technicians=", ".join(assigned_techs),
+                                assigned_hours=float(assigned_hours),
+                                required_crew_size=required_crew,
+                                mechanical_manpower=int(selected_job["mechanical_manpower"] or 0),
+                                welding_manpower=int(selected_job["welding_manpower"] or 0),
+                                priority_class=selected_job["priority_class"],
+                                priority_score=int(selected_job["priority_score"] or 8),
+                                location=selected_job["location"] or "",
+                                department=selected_job["department"] or "",
+                                notes=manual_notes,
+                                status=manual_status,
+                            )
+                            st.success("Manual draft assignment added.")
+                            st.rerun()
 
     st.markdown("##### Current Draft Schedule")
     if current_draft_df.empty:
@@ -2441,6 +2634,7 @@ with tab4:
 with tab5:
     st.subheader("Generated Crews")
     crew_rows = rows_to_df(fetch_crew_summary("Draft"))
+    crew_job_rows = rows_to_df(fetch_schedule_rows("Draft"))
     tech_lookup = get_technician_lookup(active_only=True)
     tech_names = sorted(list(tech_lookup.keys()))
     if crew_rows.empty:
@@ -2449,8 +2643,27 @@ with tab5:
         crew_rows["Remaining Crew Hours"] = 8 - crew_rows["total_hours"].astype(float)
         st.dataframe(crew_rows[[
             "day","team_label","required_crew_size","mechanical_manpower","welding_manpower",
-            "assigned_technicians","total_hours","Remaining Crew Hours","jobs","assignment_rows"
+            "assigned_technicians","total_hours","Remaining Crew Hours","assignment_rows"
         ]], use_container_width=True)
+
+        st.markdown("##### Jobs Assigned to Each Crew")
+        for _, crew in crew_rows.iterrows():
+            assigned_jobs = crew_job_rows[
+                (crew_job_rows["day"] == crew["day"])
+                & (crew_job_rows["team_label"] == crew["team_label"])
+            ]
+            expander_label = f"{crew['day']} — {crew['team_label']} ({len(assigned_jobs)} job(s))"
+            with st.expander(expander_label, expanded=False):
+                st.caption(f"Technicians: {crew['assigned_technicians'] or 'Not assigned'}")
+                if assigned_jobs.empty:
+                    st.write("No jobs assigned.")
+                else:
+                    for _, assigned_job in assigned_jobs.iterrows():
+                        st.write(
+                            f"• {assigned_job['job']} — "
+                            f"{float(assigned_job['assigned_hours'] or 0):g}h — "
+                            f"{assigned_job['priority_class']}"
+                        )
 
         st.markdown("##### Crew Editor")
         crew_rows = crew_rows.copy()
@@ -2684,12 +2897,22 @@ with tab7:
         options = {f"{row['id']} - {row['job']}": int(row["id"]) for _, row in filtered_jobs.iterrows()}
         if options:
             selected_label = st.selectbox("Select Completed Job", list(options.keys()))
+            confirm_delete = st.checkbox(
+                "I understand that permanent deletion also removes this job's schedule history.",
+                value=False,
+                key="confirm_completed_job_delete",
+            )
             cj_action1, cj_action2 = st.columns(2)
             if cj_action1.button("Reopen Selected Job", use_container_width=True):
                 reopen_completed_job(options[selected_label])
                 st.success("Completed job reopened.")
                 st.rerun()
-            if cj_action2.button("Delete Selected Job", use_container_width=True, type="primary"):
+            if cj_action2.button(
+                "Delete Selected Job",
+                use_container_width=True,
+                type="primary",
+                disabled=not confirm_delete,
+            ):
                 delete_job_permanently(options[selected_label])
                 st.success("Completed job deleted permanently.")
                 st.rerun()
@@ -2808,3 +3031,132 @@ with tab8:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
+
+
+# ---------------------------------------------------------
+# PLANNING / READINESS TAB
+# ---------------------------------------------------------
+with tab9:
+    st.subheader("Planning / Readiness")
+    planning_df = rows_to_df(fetch_all_jobs())
+    if planning_df.empty:
+        st.info("Add a job before completing readiness planning.")
+    else:
+        open_planning_df = planning_df[planning_df["status"] != "Complete"].copy()
+        ready_count = int(open_planning_df["ready_to_schedule"].fillna(0).astype(int).sum())
+        pc1, pc2, pc3 = st.columns(3)
+        pc1.metric("Open Jobs", len(open_planning_df))
+        pc2.metric("Ready to Schedule", ready_count)
+        pc3.metric("Waiting", len(open_planning_df) - ready_count)
+
+        readiness_view = open_planning_df[[
+            "id", "job", "location", "priority_class", "scope_ready", "parts_ready",
+            "permits_ready", "shutdown_ready", "ready_to_schedule"
+        ]].copy()
+        readiness_view["Planning Status"] = readiness_view["ready_to_schedule"].apply(
+            lambda value: "Ready" if int(value or 0) else "Waiting"
+        )
+        st.dataframe(readiness_view, use_container_width=True, hide_index=True)
+
+        readiness_options = {
+            f"{int(row['id'])} — {row['job']}": int(row["id"])
+            for _, row in open_planning_df.iterrows()
+        }
+        selected_readiness_label = st.selectbox("Select Job to Review", list(readiness_options.keys()))
+        selected_readiness_id = readiness_options[selected_readiness_label]
+        readiness_job = open_planning_df[open_planning_df["id"] == selected_readiness_id].iloc[0]
+        with st.form("job_readiness_form"):
+            rr1, rr2 = st.columns(2)
+            scope_ok = rr1.checkbox("Scope approved", value=bool(readiness_job["scope_ready"]))
+            parts_ok = rr2.checkbox("Parts available", value=bool(readiness_job["parts_ready"]))
+            permits_ok = rr1.checkbox("Permits and special tools ready", value=bool(readiness_job["permits_ready"]))
+            shutdown_ok = rr2.checkbox("Equipment access / shutdown approved", value=bool(readiness_job["shutdown_ready"]))
+            if st.form_submit_button("Save Readiness Review", use_container_width=True):
+                is_ready = update_job_readiness(
+                    selected_readiness_id, scope_ok, parts_ok, permits_ok, shutdown_ok
+                )
+                if is_ready:
+                    st.success("Job is ready and can now be scheduled.")
+                else:
+                    st.warning("Job saved as waiting. It will not be included in automatic scheduling.")
+                st.rerun()
+
+
+# ---------------------------------------------------------
+# VISUAL WEEKLY BOARD TAB
+# ---------------------------------------------------------
+with tab10:
+    st.subheader("Weekly Scheduling Board")
+    board_state = st.radio("Schedule", ["Draft", "Final"], horizontal=True, key="weekly_board_state")
+    board_df = rows_to_df(fetch_schedule_rows(board_state))
+    if board_df.empty:
+        st.info(f"No {board_state.lower()} assignments to display.")
+    else:
+        st.caption("Each column is a day. Jobs are grouped by crew and listed separately in working order.")
+        for day_group in (DAYS[:5], DAYS[5:]):
+            columns = st.columns(len(day_group))
+            for column, day in zip(columns, day_group):
+                with column:
+                    day_df = board_df[board_df["day"] == day]
+                    st.markdown(f"### {day}")
+                    st.caption(f"{float(day_df['assigned_hours'].sum()) if not day_df.empty else 0:g} scheduled hours")
+                    if day_df.empty:
+                        st.write("— No work —")
+                    else:
+                        for crew_name, crew_df in day_df.groupby("team_label", dropna=False):
+                            crew_label = crew_name if pd.notna(crew_name) and crew_name else "Unassigned crew"
+                            with st.expander(str(crew_label), expanded=True):
+                                technicians = crew_df["assigned_technicians"].dropna().astype(str)
+                                st.caption(technicians.iloc[0] if not technicians.empty else "No technicians")
+                                for _, board_job in crew_df.iterrows():
+                                    priority_icon = {
+                                        "Emergency": "🔴", "Urgent": "🟠", "High": "🟠",
+                                        "Medium": "🔵", "Low": "⚪"
+                                    }.get(str(board_job["priority_class"]), "🟣")
+                                    st.write(
+                                        f"{priority_icon} **{board_job['job']}**  \n"
+                                        f"{float(board_job['assigned_hours'] or 0):g}h · "
+                                        f"{board_job['location'] or 'No location'}"
+                                    )
+
+
+# ---------------------------------------------------------
+# ASSET REGISTER TAB
+# ---------------------------------------------------------
+with tab11:
+    st.subheader("Asset Register")
+    with st.expander("Add Asset", expanded=False):
+        with st.form("add_asset_form", clear_on_submit=True):
+            aa1, aa2 = st.columns(2)
+            asset_number = aa1.text_input("Asset Number")
+            asset_name = aa2.text_input("Asset Name")
+            asset_location = aa1.text_input("Location")
+            asset_department = aa2.text_input("Department")
+            asset_criticality = aa1.selectbox("Criticality", ["Critical", "High", "Normal", "Low"], index=2)
+            manufacturer = aa2.text_input("Manufacturer")
+            model = aa1.text_input("Model")
+            asset_notes = st.text_area("Asset Notes")
+            if st.form_submit_button("Save Asset", use_container_width=True):
+                if not asset_number.strip() or not asset_name.strip():
+                    st.error("Asset Number and Asset Name are required.")
+                else:
+                    try:
+                        save_asset(
+                            asset_number=asset_number, asset_name=asset_name,
+                            location=asset_location, department=asset_department,
+                            criticality=asset_criticality, manufacturer=manufacturer,
+                            model=model, active=1, notes=asset_notes,
+                        )
+                        st.success("Asset saved.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Could not save asset: {exc}")
+
+    assets_df = rows_to_df(fetch_all_assets())
+    if assets_df.empty:
+        st.info("No assets have been added yet.")
+    else:
+        st.dataframe(assets_df[[
+            "asset_number", "asset_name", "location", "department", "criticality",
+            "manufacturer", "model", "active", "notes"
+        ]], use_container_width=True, hide_index=True)
