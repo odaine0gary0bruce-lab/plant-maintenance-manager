@@ -332,8 +332,8 @@ def initialize_database():
 
         conn.execute("""
             INSERT INTO app_metadata(key, value)
-        VALUES('schema_version', '17')
-            ON CONFLICT(key) DO UPDATE SET value='17'
+        VALUES('schema_version', '18')
+            ON CONFLICT(key) DO UPDATE SET value='18'
         """)
 
 
@@ -376,6 +376,7 @@ def ensure_jobs_table(conn):
             CREATE TABLE jobs (
                 id {id_pk_sql()},
                 asset_id INTEGER,
+                work_order_number TEXT,
                 job TEXT NOT NULL,
                 location TEXT,
                 department TEXT,
@@ -409,6 +410,7 @@ def ensure_jobs_table(conn):
 
     old_cols = get_columns(conn, "jobs")
     add_column_if_missing(conn, "jobs", "asset_id", "INTEGER")
+    add_column_if_missing(conn, "jobs", "work_order_number", "TEXT")
     if "hours" in old_cols and "duration_hours" not in old_cols:
         add_column_if_missing(conn, "jobs", "duration_hours", "REAL")
     add_column_if_missing(conn, "jobs", "crew_size_required", "INTEGER NOT NULL DEFAULT 1")
@@ -525,6 +527,11 @@ def ensure_indexes(conn):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_assignments_state ON schedule_assignments(schedule_state)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_assignments_job ON schedule_assignments(job_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_assignments_day ON schedule_assignments(day)")
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_work_order_number
+        ON jobs(work_order_number)
+        WHERE work_order_number IS NOT NULL AND work_order_number <> ''
+    """)
 
 
 def seed_default_technicians_if_empty(conn):
@@ -657,6 +664,16 @@ def fetch_all_assets(active_only=False):
         return conn.execute(query).fetchall()
 
 
+def work_order_exists(work_order_number, exclude_job_id=None):
+    query = "SELECT id FROM jobs WHERE LOWER(TRIM(work_order_number))=LOWER(TRIM(?))"
+    params = [work_order_number]
+    if exclude_job_id is not None:
+        query += " AND id<>?"
+        params.append(int(exclude_job_id))
+    with get_connection() as conn:
+        return conn.execute(query, tuple(params)).fetchone() is not None
+
+
 def save_asset(**kwargs):
     with get_connection() as conn:
         conn.execute("""
@@ -692,19 +709,20 @@ def insert_job_v13(**kwargs):
     with get_connection() as conn:
         insert_sql = """
             INSERT INTO jobs (
-                asset_id, job, location, department, duration_hours,
+                asset_id, work_order_number, job, location, department, duration_hours,
                 mechanical_manpower, welding_manpower, crew_size_required,
                 priority_class, priority_score, allowed_days, preferred_day,
                 earliest_start_day, latest_finish_day, weekend_allowed,
                 requires_shutdown, fixed_day_job, can_split_across_days,
                 status, notes, scope_ready, parts_ready, permits_ready,
                 shutdown_ready, ready_to_schedule
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         if DB_BACKEND == "postgres":
             insert_sql += " RETURNING id"
         cur = conn.execute(insert_sql, (
             kwargs.get("asset_id"),
+            kwargs.get("work_order_number") or None,
             kwargs["job"].strip(),
             kwargs.get("location", "").strip(),
             kwargs.get("department", "").strip(),
@@ -739,7 +757,7 @@ def update_job_v13(job_id, **kwargs):
     with get_connection() as conn:
         conn.execute("""
             UPDATE jobs
-            SET job=?, location=?, department=?, duration_hours=?,
+            SET work_order_number=?, job=?, location=?, department=?, duration_hours=?,
                 mechanical_manpower=?, welding_manpower=?, crew_size_required=?,
                 priority_class=?, priority_score=?, allowed_days=?, preferred_day=?,
                 earliest_start_day=?, latest_finish_day=?, weekend_allowed=?,
@@ -747,6 +765,7 @@ def update_job_v13(job_id, **kwargs):
                 status=?, notes=?
             WHERE id=?
         """, (
+            kwargs.get("work_order_number") or None,
             kwargs["job"].strip(),
             kwargs.get("location", "").strip(),
             kwargs.get("department", "").strip(),
@@ -775,6 +794,7 @@ def fetch_schedule_rows(schedule_state="Draft"):
         return conn.execute("""
             SELECT
                 sa.*,
+                j.work_order_number,
                 j.job,
                 j.duration_hours,
                 j.allowed_days,
@@ -1701,62 +1721,51 @@ def build_simple_export(df, sheet_name="Export"):
 def build_job_import_template_bytes():
     template_df = pd.DataFrame([
         {
+            "Work Order Number": "WO-100245",
             "Job": "Replace pump seal",
-            "Location": "Pump P-101",
+            "Asset Number": "P-101",
+            "Location": "Utilities Building",
             "Department": "Utilities",
             "Duration Hours": 6,
             "Mechanical Manpower": 2,
             "Welding Manpower": 0,
-            "Priority": 11,
             "Crew Size": 2,
+            "Priority Level": "High",
             "Allowed Days": "Monday,Tuesday,Wednesday,Thursday,Friday",
             "Preferred Day": "Tuesday",
+            "Requires Shutdown": "No",
+            "Can Split Across Days": "No",
+            "Scope Approved": "Yes",
+            "Parts Available": "Yes",
+            "Permits Tools Ready": "Yes",
+            "Access Shutdown Ready": "Yes",
             "Notes": "Seal kit available"
-        },
-        {
-            "Job": "Repair support bracket",
-            "Location": "Line 2",
-            "Department": "Production",
-            "Duration Hours": 4,
-            "Mechanical Manpower": 0,
-            "Welding Manpower": 2,
-            "Priority": 15,
-            "Crew Size": 2,
-            "Allowed Days": "Friday,Saturday,Sunday",
-            "Preferred Day": "Saturday",
-            "Notes": "Shutdown window required"
         },
     ])
 
     instructions_df = pd.DataFrame({
         "Field": [
-            "Job",
-            "Location",
-            "Department",
-            "Duration Hours",
-            "Mechanical Manpower",
-            "Welding Manpower",
-            "Priority",
-            "Crew Size",
-            "Allowed Days",
-            "Preferred Day",
-            "Notes",
+            "Work Order Number", "Job", "Asset Number", "Location", "Department",
+            "Duration Hours", "Mechanical Manpower", "Welding Manpower", "Crew Size",
+            "Priority Level", "Allowed Days", "Preferred Day", "Requires Shutdown",
+            "Can Split Across Days", "Scope Approved", "Parts Available",
+            "Permits Tools Ready", "Access Shutdown Ready", "Notes",
         ],
         "Required": [
-            "Yes", "Yes", "Yes", "Yes", "Yes", "Yes", "Yes", "Optional", "Optional", "Optional", "Optional"
+            "Yes", "Yes", "Optional", "Optional", "Optional", "Yes", "Yes", "Yes",
+            "Optional", "Yes", "Optional", "Optional", "Optional", "Optional",
+            "Optional", "Optional", "Optional", "Optional", "Optional",
         ],
         "Description": [
-            "Job title",
-            "Asset, equipment, or work location",
-            "Department or area",
-            "Clock hours required for the job",
-            "Number of mechanical technicians required",
-            "Number of welding technicians required",
-            "Priority score from 1 to 20; higher score means higher urgency",
-            "If blank, app uses Mechanical Manpower + Welding Manpower",
-            "Comma-separated days, e.g. Monday,Tuesday,Wednesday",
-            "Single preferred day from Monday to Sunday",
-            "Free text planner notes",
+            "Unique identifier from the source maintenance system",
+            "Short description of the work", "Must match an Asset Number in the Asset Register",
+            "Physical work location", "Owning department or operating area",
+            "Estimated clock hours", "Required mechanical technicians",
+            "Required welding technicians", "Defaults to total manpower when blank",
+            "Critical, High, Normal, or Low", "Comma-separated weekday names",
+            "Preferred weekday", "Yes or No", "Yes or No", "Yes or No",
+            "Yes or No", "Yes or No", "Yes or No; all four readiness checks must be Yes to schedule",
+            "Planner instructions or source-system notes",
         ]
     })
 
@@ -1793,6 +1802,12 @@ def clean_text_import(value, default=""):
     return default if text.lower() == 'nan' else text
 
 
+def safe_bool_import(value, default=False):
+    if pd.isna(value):
+        return bool(default)
+    return str(value).strip().lower() in {"yes", "y", "true", "1", "ready", "approved"}
+
+
 def import_jobs_v14(import_df: pd.DataFrame):
     """
     Bulletproof importer:
@@ -1806,13 +1821,12 @@ def import_jobs_v14(import_df: pd.DataFrame):
     df.columns = [str(c).strip() for c in df.columns]
 
     required = [
+        "Work Order Number",
         "Job",
-        "Location",
-        "Department",
         "Duration Hours",
         "Mechanical Manpower",
         "Welding Manpower",
-        "Priority",
+        "Priority Level",
     ]
 
     missing = [c for c in required if c not in df.columns]
@@ -1821,17 +1835,23 @@ def import_jobs_v14(import_df: pd.DataFrame):
 
     inserted = 0
     report_rows = []
+    asset_lookup = {
+        str(asset["asset_number"]).strip().lower(): int(asset["id"])
+        for asset in fetch_all_assets(active_only=False)
+    }
 
     for idx, row in df.iterrows():
         excel_row = idx + 2
+        work_order_number = clean_text_import(row.get("Work Order Number", ""), "")
         job = clean_text_import(row.get("Job", ""), "")
 
-        if not job:
+        if not work_order_number or not job:
             report_rows.append({
                 "Excel Row": excel_row,
-                "Job": "",
+                "Work Order Number": work_order_number,
+                "Job": job,
                 "Result": "Skipped",
-                "Reason": "Blank job name",
+                "Reason": "Work Order Number and Job are required",
             })
             continue
 
@@ -1840,7 +1860,14 @@ def import_jobs_v14(import_df: pd.DataFrame):
         duration = safe_float_import(row.get("Duration Hours", 1.0), 1.0)
         mech = safe_int_import(row.get("Mechanical Manpower", 0), 0)
         weld = safe_int_import(row.get("Welding Manpower", 0), 0)
-        priority_score = safe_int_import(row.get("Priority", 7), 7)
+        priority_level = clean_text_import(row.get("Priority Level", "Normal"), "Normal").title()
+        priority_map = {
+            "Critical": ("Emergency", 18), "High": ("High", 12),
+            "Normal": ("Medium", 7), "Low": ("Low", 3),
+        }
+        priority_class, priority_score = priority_map.get(priority_level, priority_map["Normal"])
+        asset_number = clean_text_import(row.get("Asset Number", ""), "")
+        asset_id = asset_lookup.get(asset_number.lower()) if asset_number else None
 
         row_warnings = []
 
@@ -1848,9 +1875,10 @@ def import_jobs_v14(import_df: pd.DataFrame):
             duration = 1.0
             row_warnings.append("Duration Hours was blank/invalid; defaulted to 1.0")
 
-        if priority_score <= 0:
-            priority_score = 7
-            row_warnings.append("Priority was blank/invalid; defaulted to 7")
+        if priority_level not in priority_map:
+            row_warnings.append("Priority Level was invalid; defaulted to Normal")
+        if asset_number and asset_id is None:
+            row_warnings.append(f"Asset Number '{asset_number}' was not found; job imported without an asset link")
 
         crew_raw = row.get("Crew Size", mech + weld)
         crew = safe_int_import(crew_raw, mech + weld)
@@ -1871,6 +1899,13 @@ def import_jobs_v14(import_df: pd.DataFrame):
             row_warnings.append("Preferred Day was invalid and ignored")
 
         notes = clean_text_import(row.get("Notes", ""), "")
+        requires_shutdown = safe_bool_import(row.get("Requires Shutdown", False))
+        can_split = safe_bool_import(row.get("Can Split Across Days", True), True)
+        scope_ready = safe_bool_import(row.get("Scope Approved", False))
+        parts_ready = safe_bool_import(row.get("Parts Available", False))
+        permits_ready = safe_bool_import(row.get("Permits Tools Ready", False))
+        shutdown_ready = safe_bool_import(row.get("Access Shutdown Ready", False))
+        ready_to_schedule = scope_ready and parts_ready and permits_ready and shutdown_ready
 
         if mech == 0 and weld == 0:
             report_rows.append({
@@ -1883,6 +1918,8 @@ def import_jobs_v14(import_df: pd.DataFrame):
 
         try:
             insert_job_v13(
+                work_order_number=work_order_number,
+                asset_id=asset_id,
                 job=job,
                 location=location,
                 department=department,
@@ -1890,22 +1927,26 @@ def import_jobs_v14(import_df: pd.DataFrame):
                 mechanical_manpower=mech,
                 welding_manpower=weld,
                 crew_size_required=crew,
-                priority_class=map_score_to_priority_class(priority_score),
+                priority_class=priority_class,
                 priority_score=priority_score,
                 allowed_days=allowed_days,
                 preferred_day=preferred_day,
                 earliest_start_day=None,
                 latest_finish_day=None,
                 weekend_allowed=1 if any(d in allowed_days_list for d in ["Saturday", "Sunday"]) else 0,
-                requires_shutdown=0,
+                requires_shutdown=int(requires_shutdown),
                 fixed_day_job=1 if preferred_day and allowed_days == preferred_day else 0,
-                can_split_across_days=1,
+                can_split_across_days=int(can_split),
                 status="Pending",
                 notes=notes,
+                scope_ready=int(scope_ready), parts_ready=int(parts_ready),
+                permits_ready=int(permits_ready), shutdown_ready=int(shutdown_ready),
+                ready_to_schedule=int(ready_to_schedule),
             )
             inserted += 1
             report_rows.append({
                 "Excel Row": excel_row,
+                "Work Order Number": work_order_number,
                 "Job": job,
                 "Result": "Imported",
                 "Reason": "; ".join(row_warnings) if row_warnings else "OK",
@@ -1913,6 +1954,7 @@ def import_jobs_v14(import_df: pd.DataFrame):
         except Exception as e:
             report_rows.append({
                 "Excel Row": excel_row,
+                "Work Order Number": work_order_number,
                 "Job": job,
                 "Result": "Failed",
                 "Reason": str(e),
@@ -2011,6 +2053,10 @@ with tab2:
                 ),
             )
             c1, c2 = st.columns(2)
+            work_order_number = c1.text_input(
+                "Work Order Number",
+                help="Unique work-order identifier from the source maintenance system.",
+            )
             job_name = c1.text_input("Job Name")
             location = c2.text_input("Location / Equipment")
             department = c1.text_input("Department")
@@ -2055,7 +2101,11 @@ with tab2:
 
             submitted = st.form_submit_button("Save Job")
             if submitted:
-                if not job_name.strip():
+                if not work_order_number.strip():
+                    st.error("Work Order Number is required.")
+                elif work_order_exists(work_order_number):
+                    st.error("That Work Order Number already exists.")
+                elif not job_name.strip():
                     st.error("Job Name is required.")
                 elif len(allowed_days) == 0:
                     st.error("Please select at least one allowed day.")
@@ -2066,6 +2116,7 @@ with tab2:
                 else:
                     insert_job_v13(
                         asset_id=asset_id,
+                        work_order_number=work_order_number.strip(),
                         job=job_name,
                         location=location,
                         department=department,
@@ -2127,7 +2178,7 @@ with tab2:
             ]
 
         st.dataframe(display_jobs[[
-            "id", "job", "location", "department", "duration_hours",
+            "id", "work_order_number", "job", "location", "department", "duration_hours",
             "mechanical_manpower", "welding_manpower", "crew_size_required",
             "priority_class", "priority_score", "allowed_days",
             "preferred_day", "status", "remaining_hours", "notes"
@@ -2135,7 +2186,7 @@ with tab2:
 
         st.markdown("##### Quick Table Edit")
         editable_jobs_df = display_jobs[[
-            "id", "job", "location", "department", "duration_hours",
+            "id", "work_order_number", "job", "location", "department", "duration_hours",
             "mechanical_manpower", "welding_manpower", "crew_size_required",
             "priority_class", "priority_score", "allowed_days",
             "preferred_day", "status", "notes"
@@ -2148,6 +2199,7 @@ with tab2:
             key="jobs_quick_table_editor_v14",
             column_config={
                 "id": st.column_config.NumberColumn("ID", disabled=True),
+                "work_order_number": st.column_config.TextColumn("Work Order Number"),
                 "job": st.column_config.TextColumn("Job"),
                 "location": st.column_config.TextColumn("Location"),
                 "department": st.column_config.TextColumn("Department"),
@@ -2170,6 +2222,7 @@ with tab2:
             for _, row in editable_jobs_df.iterrows():
                 try:
                     job_id = int(row["id"])
+                    work_order_number_val = str(row["work_order_number"] or "").strip()
                     job_name = str(row["job"] or "").strip()
                     location_val = str(row["location"] or "").strip()
                     dept_val = str(row["department"] or "").strip()
@@ -2187,6 +2240,12 @@ with tab2:
                     parsed_days = [d.strip() for d in allowed_days_val.split(",") if d.strip()]
                     parsed_days = [d for d in parsed_days if d in DAYS]
 
+                    if not work_order_number_val:
+                        job_errors.append(f"Job ID {job_id}: Work Order Number is required.")
+                        continue
+                    if work_order_exists(work_order_number_val, exclude_job_id=job_id):
+                        job_errors.append(f"Job ID {job_id}: Work Order Number already exists.")
+                        continue
                     if not job_name:
                         job_errors.append(f"Job ID {job_id}: Job name is required.")
                         continue
@@ -2208,6 +2267,7 @@ with tab2:
 
                     update_job_v13(
                         job_id,
+                        work_order_number=work_order_number_val,
                         job=job_name,
                         location=location_val,
                         department=dept_val,
@@ -2284,7 +2344,7 @@ with tab3:
                 st.warning("No available jobs to assign.")
             else:
                 available_manual_jobs["job_label"] = available_manual_jobs.apply(
-                    lambda r: f"{int(r['id'])} - {r['job']}", axis=1
+                    lambda r: f"{r['work_order_number'] or 'No WO'} — {r['job']}", axis=1
                 )
                 with st.form("manual_draft_assignment_form", clear_on_submit=True):
                     md1, md2 = st.columns(2)
@@ -2660,7 +2720,7 @@ with tab5:
                 else:
                     for _, assigned_job in assigned_jobs.iterrows():
                         st.write(
-                            f"• {assigned_job['job']} — "
+                            f"• {assigned_job['work_order_number'] or 'No WO'} — {assigned_job['job']} — "
                             f"{float(assigned_job['assigned_hours'] or 0):g}h — "
                             f"{assigned_job['priority_class']}"
                         )
@@ -2798,7 +2858,7 @@ with tab6:
                         "assigned_hours", "priority_class", "status", "notes"
                     ]], use_container_width=True)
 
-        options = {f"{row['id']} - {row['day']} - {row['job']}": int(row["id"]) for _, row in current_final_df.iterrows()}
+        options = {f"{row['work_order_number'] or 'No WO'} - {row['day']} - {row['job']}": int(row["id"]) for _, row in current_final_df.iterrows()}
         selected_label = st.selectbox("Select Final Assignment", list(options.keys()), key="final_select")
         selected_id = options[selected_label]
         selected = current_final_df[current_final_df["id"] == selected_id].iloc[0]
@@ -2890,7 +2950,7 @@ with tab7:
         if priority_filter != "All":
             filtered_jobs = filtered_jobs[filtered_jobs["priority_class"] == priority_filter]
         st.dataframe(filtered_jobs[[
-            "id", "job", "location", "department", "duration_hours", "priority_class",
+            "id", "work_order_number", "job", "location", "department", "duration_hours", "priority_class",
             "priority_score", "status", "created_at", "completed_at", "notes"
         ]], use_container_width=True)
 
@@ -2955,7 +3015,7 @@ with tab8:
     st.download_button(
         "Download Job Import Template",
         data=template_bytes,
-        file_name="Plant_Maintenance_Manager_V14_Job_Template.xlsx",
+        file_name="Maintenance_Work_Order_Import_Template.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
@@ -3114,7 +3174,7 @@ with tab10:
                                         "Medium": "🔵", "Low": "⚪"
                                     }.get(str(board_job["priority_class"]), "🟣")
                                     st.write(
-                                        f"{priority_icon} **{board_job['job']}**  \n"
+                                        f"{priority_icon} **{board_job['work_order_number'] or 'No WO'} — {board_job['job']}**  \n"
                                         f"{float(board_job['assigned_hours'] or 0):g}h · "
                                         f"{board_job['location'] or 'No location'}"
                                     )
