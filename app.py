@@ -120,7 +120,7 @@ def initialize_database() -> None:
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS team_members (
-                id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, email TEXT UNIQUE,
                 skill TEXT NOT NULL, weekly_hours REAL NOT NULL DEFAULT 40,
                 availability TEXT NOT NULL DEFAULT 'Available', active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -155,6 +155,30 @@ def initialize_database() -> None:
             );
             """
         )
+        email_column = next(
+            (column for column in conn.execute("PRAGMA table_info(team_members)").fetchall() if column["name"] == "email"),
+            None,
+        )
+        if email_column and email_column["notnull"]:
+            conn.executescript(
+                """
+                ALTER TABLE team_members RENAME TO team_members_required_email;
+                CREATE TABLE team_members (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, email TEXT UNIQUE,
+                    skill TEXT NOT NULL, weekly_hours REAL NOT NULL DEFAULT 40,
+                    availability TEXT NOT NULL DEFAULT 'Available', active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                INSERT INTO team_members (
+                    id, name, role, email, skill, weekly_hours, availability, active, created_at, updated_at
+                )
+                SELECT
+                    id, name, role, NULLIF(TRIM(email), ''), skill, weekly_hours,
+                    availability, active, created_at, updated_at
+                FROM team_members_required_email;
+                DROP TABLE team_members_required_email;
+                """
+            )
         stamp = now()
         if conn.execute("SELECT COUNT(*) FROM team_members").fetchone()[0] == 0:
             team = [
@@ -190,13 +214,14 @@ initialize_database()
 def save_team(data: dict, member_id: str | None = None) -> None:
     member_id = member_id or uid("TM")
     stamp = now()
+    email = str(data.get("email") or "").strip().lower() or None
     with connection() as conn:
         if conn.execute("SELECT 1 FROM team_members WHERE id=?", (member_id,)).fetchone():
             conn.execute("UPDATE team_members SET name=?,role=?,email=?,skill=?,weekly_hours=?,availability=?,active=?,updated_at=? WHERE id=?",
-                         (data["name"], data["role"], data["email"].lower(), data["skill"], data["hours"], data["availability"], int(data["active"]), stamp, member_id))
+                         (data["name"], data["role"], email, data["skill"], data["hours"], data["availability"], int(data["active"]), stamp, member_id))
         else:
             conn.execute("INSERT INTO team_members VALUES (?,?,?,?,?,?,?,?,?,?)",
-                         (member_id, data["name"], data["role"], data["email"].lower(), data["skill"], data["hours"], data["availability"], int(data["active"]), stamp, stamp))
+                         (member_id, data["name"], data["role"], email, data["skill"], data["hours"], data["availability"], int(data["active"]), stamp, stamp))
 
 
 def save_asset(data: dict, asset_id: str | None = None) -> None:
@@ -211,7 +236,9 @@ def save_asset(data: dict, asset_id: str | None = None) -> None:
 
 
 def save_job(data: dict, job_id: str | None = None) -> None:
-    job_id = job_id or f"WO-{3000 + uuid.uuid4().int % 6999}"
+    job_id = cell_text(job_id or data.get("work_order_id"))
+    if not job_id:
+        raise ValueError("Work order number is required.")
     stamp = now()
     values = (data["title"], data["asset"], data["location"], data["department"], data["due_at"], data["duration"], data["priority"], data["score"], data["status"], data["category"], data["crew"], data["mechanical"], data["welding"], ",".join(data["allowed_days"]), data["preferred_day"], int(data["scope"]), int(data["parts"]), int(data["permits"]), int(data["shutdown"]), int(data["released"]), data["notes"])
     with connection() as conn:
@@ -303,7 +330,7 @@ def team_table_editor(team: list[dict]) -> None:
             "id": st.column_config.TextColumn("ID"),
             "name": st.column_config.TextColumn("Name", required=True),
             "role": st.column_config.TextColumn("Role", required=True),
-            "email": st.column_config.TextColumn("Email", required=True),
+            "email": st.column_config.TextColumn("Email (optional)"),
             "skill": st.column_config.SelectboxColumn("Skill", options=SKILLS, required=True),
             "weekly_hours": st.column_config.NumberColumn("Weekly hours", min_value=1, max_value=84, step=1),
             "availability": st.column_config.SelectboxColumn("Availability", options=["Available", "Limited", "Unavailable"]),
@@ -313,11 +340,11 @@ def team_table_editor(team: list[dict]) -> None:
     if st.button("Save team table", type="primary", use_container_width=True):
         records = edited.to_dict("records")
         names = [cell_text(record.get("name")) for record in records]
-        emails = [cell_text(record.get("email")).lower() for record in records]
-        if any(not name for name in names) or any(not email for email in emails):
-            st.error("Every team member needs a name and email.")
+        emails = [cell_text(record.get("email")).lower() for record in records if cell_text(record.get("email"))]
+        if any(not name for name in names):
+            st.error("Every team member needs a name.")
         elif len(emails) != len(set(emails)):
-            st.error("Each team member must have a unique email address.")
+            st.error("Email addresses must be unique when provided.")
         else:
             try:
                 for record in records:
@@ -376,7 +403,8 @@ def asset_table_editor(assets: list[dict]) -> None:
 
 def job_column_config() -> dict:
     return {
-        "id": st.column_config.TextColumn("Work order"),
+        "_original_id": None,
+        "id": st.column_config.TextColumn("Work order number", required=True),
         "title": st.column_config.TextColumn("Job", required=True),
         "asset": st.column_config.TextColumn("Asset"),
         "location": st.column_config.TextColumn("Location"),
@@ -411,24 +439,53 @@ JOB_TABLE_COLUMNS = [
 
 def job_table_editor(jobs: list[dict], key: str = "jobs_spreadsheet") -> None:
     frame = pd.DataFrame(jobs, columns=JOB_TABLE_COLUMNS)
+    frame.insert(0, "_original_id", frame["id"])
     edited = st.data_editor(
         frame,
         key=key,
         use_container_width=True,
         hide_index=True,
-        num_rows="fixed",
-        disabled=["id"],
+        num_rows="dynamic",
+        disabled=["_original_id"],
         column_config=job_column_config(),
         height=520,
     )
     if st.button("Save work-order table", type="primary", use_container_width=True, key=f"{key}_save"):
-        records = edited.to_dict("records")
-        if any(not cell_text(record.get("title")) for record in records):
+        records = [
+            record for record in edited.to_dict("records")
+            if cell_text(record.get("id")) or cell_text(record.get("title"))
+        ]
+        work_order_numbers = [cell_text(record.get("id")) for record in records]
+        original_ids = {cell_text(job.get("id")) for job in jobs}
+        retained_original_ids = {cell_text(record.get("_original_id")) for record in records if cell_text(record.get("_original_id"))}
+        changed_ids = [
+            record for record in records
+            if cell_text(record.get("_original_id"))
+            and cell_text(record.get("_original_id")) != cell_text(record.get("id"))
+        ]
+        new_ids = {
+            cell_text(record.get("id")) for record in records
+            if not cell_text(record.get("_original_id"))
+        }
+        database_ids = {record["id"] for record in rows("SELECT id FROM work_orders")}
+        if any(not number for number in work_order_numbers):
+            st.error("Every row needs your work order number.")
+        elif len(work_order_numbers) != len(set(work_order_numbers)):
+            st.error("Work order numbers must be unique.")
+        elif changed_ids:
+            st.error("An existing work order number cannot be changed in the table. Delete that row and add a new row with the correct number.")
+        elif new_ids & database_ids:
+            st.error(f"These work order numbers already exist: {', '.join(sorted(new_ids & database_ids))}")
+        elif any(not cell_text(record.get("title")) for record in records):
             st.error("Every work order needs a job title.")
         else:
             for record in records:
                 save_job(job_data_from_row(record), cell_text(record["id"]))
-            flash("Work-order table saved. Jobs are ready for planning review.")
+            removed_ids = original_ids - retained_original_ids
+            if removed_ids:
+                with connection() as conn:
+                    conn.executemany("DELETE FROM work_orders WHERE id=?", [(job_id,) for job_id in removed_ids])
+            flash("Work-order table saved. Added, edited and removed jobs are ready for planning.")
 
 
 def assignment_table_editor(state: str, assignments: list[dict]) -> None:
@@ -557,7 +614,7 @@ def excel_import_workspace(key_prefix: str) -> None:
             st.error(f"The workbook could not be read: {exc}")
     imported = st.session_state.get(f"{key_prefix}_frame")
     if isinstance(imported, pd.DataFrame):
-        st.info("Edit any missing or incorrect scheduling fields below. Required fields are Job, Duration, Crew size, Allowed days, and Release.")
+        st.info("Edit any missing or incorrect scheduling fields below. Work order number and Job are required.")
         reviewed = st.data_editor(
             imported,
             key=f"{key_prefix}_review_{st.session_state.get(f'{key_prefix}_batch', 'current')}",
@@ -572,13 +629,15 @@ def excel_import_workspace(key_prefix: str) -> None:
             records = reviewed.to_dict("records")
             if not records:
                 st.error("The import table is empty.")
+            elif any(not cell_text(record.get("id")) for record in records):
+                st.error("Every imported job needs your Work order number.")
             elif any(not cell_text(record.get("title")) for record in records):
                 st.error("Every imported job needs a Job value.")
             else:
                 created = updated = 0
                 existing_ids = {job["id"] for job in rows("SELECT id FROM work_orders")}
                 for record in records:
-                    job_id = cell_text(record.get("id")) or f"WO-{3000 + uuid.uuid4().int % 6999}"
+                    job_id = cell_text(record.get("id"))
                     if job_id in existing_ids:
                         updated += 1
                     else:
@@ -679,7 +738,7 @@ def team_form(prefix: str, member: dict | None = None) -> tuple[bool, dict]:
         c1, c2 = st.columns(2)
         name = c1.text_input("Name", member.get("name", ""))
         role = c2.text_input("Role", member.get("role", "Maintenance technician"))
-        email = c1.text_input("Email", member.get("email", ""))
+        email = c1.text_input("Email (optional)", member.get("email") or "")
         skill = c2.selectbox("Skill", SKILLS, index=safe_index(SKILLS, member.get("skill", "Mechanical")))
         availability_options = ["Available", "Limited", "Unavailable"]
         availability = c1.selectbox("Availability", availability_options, index=safe_index(availability_options, member.get("availability", "Available")))
@@ -709,17 +768,21 @@ def asset_form(prefix: str, asset: dict | None = None) -> tuple[bool, dict]:
 
 def job_form(prefix: str, job: dict | None = None) -> tuple[bool, dict]:
     job = job or {}
-    assets = rows("SELECT * FROM assets WHERE active=1 ORDER BY asset_number")
-    asset_options = ["UNASSIGNED", *[a["asset_number"] for a in assets]]
     due = datetime.now() + timedelta(days=2)
     try:
         due = datetime.fromisoformat(job.get("due_at", ""))
     except ValueError:
         pass
     with st.form(f"{prefix}_job"):
+        work_order_id = st.text_input(
+            "Work order number",
+            job.get("id", ""),
+            disabled=bool(job.get("id")),
+            help="Enter the number used by your plant or maintenance system.",
+        )
         name = st.text_input("Job name", job.get("title", ""))
         c1, c2, c3 = st.columns(3)
-        asset = c1.selectbox("Asset", asset_options, index=safe_index(asset_options, job.get("asset", "UNASSIGNED")))
+        asset = c1.text_input("Asset / equipment (optional)", job.get("asset", ""))
         location = c2.text_input("Location", job.get("location", "Plant"))
         department = c3.text_input("Department", job.get("department", "Operations"))
         due_date = c1.date_input("Due date", due.date())
@@ -745,7 +808,7 @@ def job_form(prefix: str, job: dict | None = None) -> tuple[bool, dict]:
         released = r5.checkbox("Release", bool(job.get("released", 1)))
         notes = st.text_area("Notes", job.get("notes", ""))
         submitted = st.form_submit_button("Save work order", type="primary", use_container_width=True)
-    return submitted, {"title":name.strip(), "asset":asset, "location":location.strip(), "department":department.strip(), "due_at":datetime.combine(due_date, due_time).isoformat(), "duration":duration, "priority":priority, "score":score, "status":status, "category":category.strip(), "crew":crew, "mechanical":mechanical, "welding":welding, "allowed_days":allowed, "preferred_day":"" if preferred == "No preference" else preferred, "scope":scope, "parts":parts, "permits":permits, "shutdown":shutdown, "released":released, "notes":notes.strip()}
+    return submitted, {"work_order_id":work_order_id.strip(), "title":name.strip(), "asset":asset.strip() or "UNASSIGNED", "location":location.strip(), "department":department.strip(), "due_at":datetime.combine(due_date, due_time).isoformat(), "duration":duration, "priority":priority, "score":score, "status":status, "category":category.strip(), "crew":crew, "mechanical":mechanical, "welding":welding, "allowed_days":allowed, "preferred_day":"" if preferred == "No preference" else preferred, "scope":scope, "parts":parts, "permits":permits, "shutdown":shutdown, "released":released, "notes":notes.strip()}
 
 
 def assignment_rows(state: str | None = None) -> list[dict]:
@@ -775,7 +838,7 @@ def board(state: str) -> None:
 
 with st.sidebar:
     st.markdown('<div class="brand"><span>M</span><b>Maintainly</b><small>Plant maintenance</small></div>', unsafe_allow_html=True)
-    page = st.radio("Navigation", ["Schedule", "Work orders", "Planning", "Assets", "Team", "Reports"], label_visibility="collapsed")
+    page = st.radio("Navigation", ["Schedule", "Work orders", "Planning", "Team", "Reports"], label_visibility="collapsed")
     st.markdown("---")
     st.caption("Persistent Streamlit edition")
 
@@ -812,14 +875,14 @@ elif page == "Team":
     with add:
         submitted, data = team_form("add")
         if submitted:
-            if not data["name"] or not data["email"]:
-                st.error("Name and email are required.")
+            if not data["name"]:
+                st.error("Name is required.")
             else:
                 try:
                     save_team(data)
                     flash("Team member added.")
                 except sqlite3.IntegrityError:
-                    st.error("That email address is already in use.")
+                    st.error("That email address is already in use. Leave it blank if the member has no email.")
     with edit:
         if team:
             labels = {m["id"]: f"{m['name']} - {m['skill']}" for m in team}
@@ -831,7 +894,7 @@ elif page == "Team":
                     save_team(data, member_id)
                     flash("Team member updated.")
                 except sqlite3.IntegrityError:
-                    st.error("That email address is already in use.")
+                    st.error("That email address is already in use. Leave it blank if the member has no email.")
             if st.button("Delete selected team member"):
                 with connection() as conn:
                     conn.execute("DELETE FROM team_members WHERE id=?", (member_id,))
@@ -876,20 +939,28 @@ elif page == "Assets":
 elif page == "Work orders":
     title("Work orders", "Prioritize, assign and close out maintenance work.")
     jobs = rows("SELECT * FROM work_orders ORDER BY priority_score DESC,due_at")
-    add, register, import_tab, edit = st.tabs(["Add work order", "Table editor", "Import Excel", "Edit / delete"])
-    with add:
-        submitted, data = job_form("add")
-        if submitted:
-            if not data["title"] or not data["allowed_days"]:
-                st.error("Job name and at least one allowed day are required.")
-            else:
-                save_job(data)
-                flash("Work order created.")
+    register, add, import_tab, edit = st.tabs(["Table editor", "Add form", "Import Excel", "Edit / delete"])
     with register:
         filter_value = st.selectbox("Filter", ["Open", "All", *JOB_STATUSES])
         filtered = jobs if filter_value == "All" else [j for j in jobs if (j["status"] != "Completed" if filter_value == "Open" else j["status"] == filter_value)]
-        st.caption("Edit work orders and scheduling requirements in spreadsheet form, then save the table.")
+        st.caption("Add a row, enter your work order number and job details, then save the table.")
         job_table_editor(filtered, "work_order_table")
+    with add:
+        submitted, data = job_form("add")
+        if submitted:
+            if not data["work_order_id"] or not data["title"] or not data["allowed_days"]:
+                st.error("Work order number, job name and at least one allowed day are required.")
+            else:
+                try:
+                    with connection() as conn:
+                        exists = conn.execute("SELECT 1 FROM work_orders WHERE id=?", (data["work_order_id"],)).fetchone()
+                    if exists:
+                        st.error("That work order number already exists.")
+                    else:
+                        save_job(data)
+                        flash("Work order created.")
+                except sqlite3.IntegrityError:
+                    st.error("That work order number already exists.")
     with import_tab:
         excel_import_workspace("work_orders_excel")
     with edit:
@@ -905,6 +976,18 @@ elif page == "Work orders":
                 with connection() as conn:
                     conn.execute("DELETE FROM work_orders WHERE id=?", (job_id,))
                 flash("Work order deleted.")
+        if jobs:
+            st.divider()
+            st.subheader("Delete all work orders")
+            st.warning("This also removes every draft and final schedule assignment linked to the work orders.")
+            confirm_delete_all = st.checkbox("I understand and want to delete all work orders")
+            if st.button("Delete all work orders", disabled=not confirm_delete_all, type="primary"):
+                with connection() as conn:
+                    count = conn.execute("SELECT COUNT(*) FROM work_orders").fetchone()[0]
+                    conn.execute("DELETE FROM schedule_history")
+                    conn.execute("DELETE FROM assignments")
+                    conn.execute("DELETE FROM work_orders")
+                flash(f"{count} work order(s) deleted.")
 
 elif page == "Planning":
     title("Planning", "Turn the maintenance backlog into validated crews and a final weekly plan.")
