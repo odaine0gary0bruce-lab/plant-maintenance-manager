@@ -153,6 +153,9 @@ def initialize_database() -> None:
                 id TEXT PRIMARY KEY, assignment_id TEXT NOT NULL, action TEXT NOT NULL,
                 detail TEXT NOT NULL DEFAULT '', changed_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS app_migrations (
+                name TEXT PRIMARY KEY, applied_at TEXT NOT NULL
+            );
             """
         )
         email_column = next(
@@ -179,6 +182,28 @@ def initialize_database() -> None:
                 DROP TABLE team_members_required_email;
                 """
             )
+        sample_cleanup = "remove_builtin_sample_work_orders_v1"
+        if not conn.execute("SELECT 1 FROM app_migrations WHERE name=?", (sample_cleanup,)).fetchone():
+            sample_filter = """
+                (w.id='WO-2842' AND w.title='Generator load bank test') OR
+                (w.id='WO-2848' AND w.title='Chiller water sample') OR
+                (w.id='WO-2850' AND w.title='Conveyor belt alignment') OR
+                (w.id='WO-2854' AND w.title='Dock frame weld repair')
+            """
+            conn.execute(
+                f"""DELETE FROM schedule_history WHERE assignment_id IN (
+                    SELECT a.id FROM assignments a
+                    JOIN work_orders w ON w.id=a.work_order_id
+                    WHERE {sample_filter}
+                )"""
+            )
+            conn.execute(
+                f"""DELETE FROM assignments WHERE work_order_id IN (
+                    SELECT w.id FROM work_orders w WHERE {sample_filter}
+                )"""
+            )
+            conn.execute(f"DELETE FROM work_orders AS w WHERE {sample_filter}")
+            conn.execute("INSERT INTO app_migrations VALUES (?,?)", (sample_cleanup, now()))
         stamp = now()
         if conn.execute("SELECT COUNT(*) FROM team_members").fetchone()[0] == 0:
             team = [
@@ -195,17 +220,6 @@ def initialize_database() -> None:
                 ("AS-DOCK07", "DOCK-07", "Dock Door 07", "Warehouse - Bay 7", "Warehouse", "High", "Rite-Hite", "RHH-5000", 1, "Safety interlocks installed"),
             ]
             conn.executemany("INSERT INTO assets VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [(*item, stamp, stamp) for item in assets])
-        if conn.execute("SELECT COUNT(*) FROM work_orders").fetchone()[0] == 0:
-            due = (datetime.now() + timedelta(days=2)).replace(hour=9, minute=0, second=0, microsecond=0).isoformat()
-            jobs = [
-                ("WO-2842", "Generator load bank test", "GEN-02", "Utility yard", "Utilities", due, 2.5, "Critical", 18, "Pending", "Electrical", 2, 1, 0, ",".join(DAYS[:5]), "Tuesday", 1, 1, 1, 1, 1, "Coordinate the test window with security."),
-                ("WO-2850", "Conveyor belt alignment", "DOCK-07", "Warehouse - Bay 7", "Warehouse", due, 3.0, "High", 12, "Pending", "Mechanical", 2, 2, 0, ",".join(DAYS[:5]), "Thursday", 1, 1, 1, 1, 1, "Check tracking after a 20-minute run."),
-            ]
-            conn.executemany(
-                """INSERT INTO work_orders (id,title,asset,location,department,due_at,duration_hours,priority,priority_score,status,category,crew_size,mechanical_needed,welding_needed,allowed_days,preferred_day,scope_ready,parts_ready,permits_ready,shutdown_ready,released,notes,completed_at,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,?)""",
-                [(*item, stamp, stamp) for item in jobs],
-            )
 
 
 initialize_database()
@@ -486,7 +500,6 @@ def job_table_editor(jobs: list[dict], key: str = "jobs_spreadsheet") -> None:
                 with connection() as conn:
                     conn.executemany("DELETE FROM work_orders WHERE id=?", [(job_id,) for job_id in removed_ids])
             flash("Work-order table saved. Added, edited and removed jobs are ready for planning.")
-
 
 def assignment_table_editor(state: str, assignments: list[dict]) -> None:
     columns = ["id", "day", "crew_label", "work_order_id", "title", "technicians", "hours", "status", "notes"]
@@ -810,7 +823,6 @@ def job_form(prefix: str, job: dict | None = None) -> tuple[bool, dict]:
         submitted = st.form_submit_button("Save work order", type="primary", use_container_width=True)
     return submitted, {"work_order_id":work_order_id.strip(), "title":name.strip(), "asset":asset.strip() or "UNASSIGNED", "location":location.strip(), "department":department.strip(), "due_at":datetime.combine(due_date, due_time).isoformat(), "duration":duration, "priority":priority, "score":score, "status":status, "category":category.strip(), "crew":crew, "mechanical":mechanical, "welding":welding, "allowed_days":allowed, "preferred_day":"" if preferred == "No preference" else preferred, "scope":scope, "parts":parts, "permits":permits, "shutdown":shutdown, "released":released, "notes":notes.strip()}
 
-
 def assignment_rows(state: str | None = None) -> list[dict]:
     query = """SELECT a.*,w.title,w.asset,w.location FROM assignments a LEFT JOIN work_orders w ON w.id=a.work_order_id"""
     params = ()
@@ -976,7 +988,6 @@ elif page == "Work orders":
                 with connection() as conn:
                     conn.execute("DELETE FROM work_orders WHERE id=?", (job_id,))
                 flash("Work order deleted.")
-        if jobs:
             st.divider()
             st.subheader("Delete all work orders")
             st.warning("This also removes every draft and final schedule assignment linked to the work orders.")
