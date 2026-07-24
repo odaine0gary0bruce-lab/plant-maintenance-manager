@@ -698,6 +698,67 @@ def assignment_table_editor(state: str, assignments: list[dict]) -> None:
             "notes": st.column_config.TextColumn("Notes"),
         },
     )
+    if state == "Draft" and assignments and crew_options:
+        st.markdown("#### Change a job's saved crew")
+        assignment_labels = {
+            assignment["id"]: (
+                f"{assignment['work_order_id']} - {assignment['title']} "
+                f"({assignment['crew_label']})"
+            )
+            for assignment in assignments
+        }
+        selected_assignment_id = st.selectbox(
+            "Draft job",
+            list(assignment_labels),
+            format_func=assignment_labels.get,
+            key="draft_saved_crew_assignment",
+        )
+        selected_assignment = next(
+            assignment for assignment in assignments
+            if assignment["id"] == selected_assignment_id
+        )
+        selected_crew = st.selectbox(
+            "Assigned saved crew",
+            crew_options,
+            index=safe_index(crew_options, selected_assignment["crew_label"]),
+            key=f"draft_saved_crew_choice_{selected_assignment_id}",
+        )
+        selected_people = crew_members.get(selected_crew, [])
+        st.info(
+            f"People in {selected_crew}: "
+            f"{', '.join(selected_people) if selected_people else 'No saved members'}"
+        )
+        if st.button(
+            "Apply this crew to the draft job",
+            type="primary",
+            use_container_width=True,
+            key=f"apply_saved_crew_{selected_assignment_id}",
+        ):
+            if not selected_people:
+                st.error("The selected saved crew has no members.")
+            else:
+                with connection() as conn:
+                    conn.execute(
+                        """UPDATE assignments
+                           SET crew_label=?,technicians=?,updated_at=?
+                           WHERE id=? AND state='Draft'""",
+                        (
+                            selected_crew,
+                            ",".join(selected_people),
+                            now(),
+                            selected_assignment_id,
+                        ),
+                    )
+                    history(
+                        conn,
+                        selected_assignment_id,
+                        "Crew changed",
+                        f"{selected_assignment['crew_label']} to {selected_crew}",
+                    )
+                flash(
+                    f"{selected_assignment['work_order_id']} assigned to "
+                    f"{selected_crew}: {', '.join(selected_people)}."
+                )
     if st.button(f"Save {state.lower()} table", type="primary", use_container_width=True, key=f"save_{state.lower()}_table"):
         records = edited.to_dict("records")
         if state == "Draft" and any(cell_text(record["crew_label"]) not in crew_members for record in records):
