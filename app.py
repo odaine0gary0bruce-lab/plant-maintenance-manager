@@ -69,6 +69,11 @@ st.markdown(
     div[data-testid="stDataFrame"] { border:1px solid var(--line); border-radius:14px; overflow:hidden; }
     .stButton button, .stDownloadButton button { border-radius:10px; font-weight:700; }
     .stButton button[kind="primary"] { background:var(--green); border-color:var(--green); }
+    [data-testid="stTabs"] div[role="tablist"] { flex-wrap:wrap; gap:.25rem; }
+    [data-testid="stTabs"] button[role="tab"] { flex:0 0 auto; font-weight:700; }
+    @media (max-width: 900px) {
+        .main .block-container { padding:1rem .75rem 2rem; }
+    }
     .board-card { background:#fff; border:1px solid var(--line); border-left:4px solid var(--green);
         border-radius:11px; padding:.7rem; margin:.45rem 0; min-height:100px; }
     .board-card small { color:var(--green); font-weight:800; }
@@ -684,64 +689,56 @@ def assignment_table_editor(state: str, assignments: list[dict]) -> None:
             st.error("Create an active saved crew in Team → Crews before editing the Draft table.")
             return
 
-        widths = [1.05, 1.45, 2.0, 1.2, 2.1, .8, 1.15, 1.7]
-        headers = st.columns(widths)
-        for column, heading in zip(
-            headers,
-            ["Day", "Crew", "People in crew", "Work order", "Job", "Hours", "Status", "Notes"],
-        ):
-            column.markdown(f"**{heading}**")
-
         changes = []
         status_options = ["Scheduled", "In Progress", "Deferred", "Complete"]
         for assignment in assignments:
             with st.container(border=True):
-                columns = st.columns(widths)
-                day = columns[0].selectbox(
+                primary = st.columns([1.0, 1.4, 2.1, 1.2])
+                day = primary[0].selectbox(
                     "Day",
                     DAYS,
                     index=safe_index(DAYS, assignment["day"]),
                     key=f"draft_grid_day_{assignment['id']}",
-                    label_visibility="collapsed",
                 )
                 row_crew_options = list(active_crew_names)
                 if assignment["crew_label"] not in row_crew_options:
                     row_crew_options.append(assignment["crew_label"])
-                crew_name = columns[1].selectbox(
+                crew_name = primary[1].selectbox(
                     "Crew",
                     row_crew_options,
                     index=safe_index(row_crew_options, assignment["crew_label"]),
                     key=f"draft_grid_crew_{assignment['id']}",
-                    label_visibility="collapsed",
                 )
                 people = crew_members.get(
                     crew_name,
                     [name.strip() for name in assignment["technicians"].split(",") if name.strip()],
                 )
-                columns[2].markdown(", ".join(people) if people else "_No saved members_")
-                columns[3].markdown(str(assignment["work_order_id"]))
-                columns[4].markdown(str(assignment.get("title", "")))
-                hours = columns[5].number_input(
+                primary[2].caption("People in crew")
+                primary[2].markdown(", ".join(people) if people else "_No saved members_")
+                primary[3].caption("Work order")
+                primary[3].markdown(f"**{assignment['work_order_id']}**")
+
+                secondary = st.columns([2.5, .8, 1.2, 2.2])
+                secondary[0].caption("Job")
+                secondary[0].markdown(str(assignment.get("title", "")))
+                hours = secondary[1].number_input(
                     "Hours",
                     min_value=.5,
                     max_value=168.0,
                     step=.5,
                     value=float(assignment["hours"]),
                     key=f"draft_grid_hours_{assignment['id']}",
-                    label_visibility="collapsed",
                 )
-                status = columns[6].selectbox(
+                status = secondary[2].selectbox(
                     "Status",
                     status_options,
                     index=safe_index(status_options, assignment["status"]),
                     key=f"draft_grid_status_{assignment['id']}",
-                    label_visibility="collapsed",
                 )
-                notes = columns[7].text_input(
+                notes = secondary[3].text_input(
                     "Notes",
                     value=assignment["notes"],
                     key=f"draft_grid_notes_{assignment['id']}",
-                    label_visibility="collapsed",
                 )
                 changes.append({
                     "id": assignment["id"],
