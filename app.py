@@ -674,6 +674,119 @@ def assignment_table_editor(state: str, assignments: list[dict]) -> None:
     for assignment in assignments:
         if assignment["crew_label"] not in crew_options:
             crew_options.append(assignment["crew_label"])
+
+    if state == "Draft":
+        if not assignments:
+            st.markdown('<div class="empty">No assignments in this schedule yet.</div>', unsafe_allow_html=True)
+            return
+        active_crew_names = list(crew_members)
+        if not active_crew_names:
+            st.error("Create an active saved crew in Team → Crews before editing the Draft table.")
+            return
+
+        widths = [1.05, 1.45, 2.0, 1.2, 2.1, .8, 1.15, 1.7]
+        headers = st.columns(widths)
+        for column, heading in zip(
+            headers,
+            ["Day", "Crew", "People in crew", "Work order", "Job", "Hours", "Status", "Notes"],
+        ):
+            column.markdown(f"**{heading}**")
+
+        changes = []
+        status_options = ["Scheduled", "In Progress", "Deferred", "Complete"]
+        for assignment in assignments:
+            with st.container(border=True):
+                columns = st.columns(widths)
+                day = columns[0].selectbox(
+                    "Day",
+                    DAYS,
+                    index=safe_index(DAYS, assignment["day"]),
+                    key=f"draft_grid_day_{assignment['id']}",
+                    label_visibility="collapsed",
+                )
+                row_crew_options = list(active_crew_names)
+                if assignment["crew_label"] not in row_crew_options:
+                    row_crew_options.append(assignment["crew_label"])
+                crew_name = columns[1].selectbox(
+                    "Crew",
+                    row_crew_options,
+                    index=safe_index(row_crew_options, assignment["crew_label"]),
+                    key=f"draft_grid_crew_{assignment['id']}",
+                    label_visibility="collapsed",
+                )
+                people = crew_members.get(
+                    crew_name,
+                    [name.strip() for name in assignment["technicians"].split(",") if name.strip()],
+                )
+                columns[2].markdown(", ".join(people) if people else "_No saved members_")
+                columns[3].markdown(str(assignment["work_order_id"]))
+                columns[4].markdown(str(assignment.get("title", "")))
+                hours = columns[5].number_input(
+                    "Hours",
+                    min_value=.5,
+                    max_value=168.0,
+                    step=.5,
+                    value=float(assignment["hours"]),
+                    key=f"draft_grid_hours_{assignment['id']}",
+                    label_visibility="collapsed",
+                )
+                status = columns[6].selectbox(
+                    "Status",
+                    status_options,
+                    index=safe_index(status_options, assignment["status"]),
+                    key=f"draft_grid_status_{assignment['id']}",
+                    label_visibility="collapsed",
+                )
+                notes = columns[7].text_input(
+                    "Notes",
+                    value=assignment["notes"],
+                    key=f"draft_grid_notes_{assignment['id']}",
+                    label_visibility="collapsed",
+                )
+                changes.append({
+                    "id": assignment["id"],
+                    "day": day,
+                    "crew_label": crew_name,
+                    "people": people,
+                    "hours": hours,
+                    "status": status,
+                    "notes": notes,
+                })
+
+        if st.button("Save draft table", type="primary", use_container_width=True, key="save_draft_grid"):
+            invalid = [
+                change for change in changes
+                if change["crew_label"] not in crew_members or not change["people"]
+            ]
+            if invalid:
+                st.error("Every draft job must use an active saved crew that has members.")
+                return
+            with connection() as conn:
+                for change in changes:
+                    conn.execute(
+                        """UPDATE assignments
+                           SET day=?,crew_label=?,technicians=?,hours=?,status=?,notes=?,updated_at=?
+                           WHERE id=? AND state='Draft'""",
+                        (
+                            change["day"],
+                            change["crew_label"],
+                            ",".join(change["people"]),
+                            change["hours"],
+                            change["status"],
+                            change["notes"],
+                            now(),
+                            change["id"],
+                        ),
+                    )
+                    history(
+                        conn,
+                        change["id"],
+                        "Table updated",
+                        f"Draft crew: {change['crew_label']}",
+                    )
+            flash("Draft table saved with the selected crews and their exact members.")
+        return
+
     columns = ["id", "day", "crew_label", "work_order_id", "title", "technicians", "hours", "status", "notes"]
     frame = pd.DataFrame(assignments, columns=columns)
     disabled = ["id", "work_order_id", "title", "technicians"]
@@ -698,67 +811,6 @@ def assignment_table_editor(state: str, assignments: list[dict]) -> None:
             "notes": st.column_config.TextColumn("Notes"),
         },
     )
-    if state == "Draft" and assignments and crew_options:
-        st.markdown("#### Change a job's saved crew")
-        assignment_labels = {
-            assignment["id"]: (
-                f"{assignment['work_order_id']} - {assignment['title']} "
-                f"({assignment['crew_label']})"
-            )
-            for assignment in assignments
-        }
-        selected_assignment_id = st.selectbox(
-            "Draft job",
-            list(assignment_labels),
-            format_func=assignment_labels.get,
-            key="draft_saved_crew_assignment",
-        )
-        selected_assignment = next(
-            assignment for assignment in assignments
-            if assignment["id"] == selected_assignment_id
-        )
-        selected_crew = st.selectbox(
-            "Assigned saved crew",
-            crew_options,
-            index=safe_index(crew_options, selected_assignment["crew_label"]),
-            key=f"draft_saved_crew_choice_{selected_assignment_id}",
-        )
-        selected_people = crew_members.get(selected_crew, [])
-        st.info(
-            f"People in {selected_crew}: "
-            f"{', '.join(selected_people) if selected_people else 'No saved members'}"
-        )
-        if st.button(
-            "Apply this crew to the draft job",
-            type="primary",
-            use_container_width=True,
-            key=f"apply_saved_crew_{selected_assignment_id}",
-        ):
-            if not selected_people:
-                st.error("The selected saved crew has no members.")
-            else:
-                with connection() as conn:
-                    conn.execute(
-                        """UPDATE assignments
-                           SET crew_label=?,technicians=?,updated_at=?
-                           WHERE id=? AND state='Draft'""",
-                        (
-                            selected_crew,
-                            ",".join(selected_people),
-                            now(),
-                            selected_assignment_id,
-                        ),
-                    )
-                    history(
-                        conn,
-                        selected_assignment_id,
-                        "Crew changed",
-                        f"{selected_assignment['crew_label']} to {selected_crew}",
-                    )
-                flash(
-                    f"{selected_assignment['work_order_id']} assigned to "
-                    f"{selected_crew}: {', '.join(selected_people)}."
-                )
     if st.button(f"Save {state.lower()} table", type="primary", use_container_width=True, key=f"save_{state.lower()}_table"):
         records = edited.to_dict("records")
         if state == "Draft" and any(cell_text(record["crew_label"]) not in crew_members for record in records):
@@ -1379,7 +1431,7 @@ elif page == "Planning":
             flash(f"{count} draft assignment(s) generated.")
         for warning in st.session_state.get("warnings", []):
             st.warning(warning)
-        st.caption("Edit the generated draft directly in the table and save before promoting it.")
+        st.caption("Change the Crew cell and the People in crew column updates immediately on that row.")
         assignment_table_editor("Draft", draft)
         if st.button("Promote all draft assignments"):
             flash(f"{promote_all()} assignment(s) promoted to Final.")
