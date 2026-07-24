@@ -681,7 +681,12 @@ def assignment_table_editor(state: str, assignments: list[dict]) -> None:
             crew_options.append(assignment["crew_label"])
 
     if state == "Draft":
+        frame_key = "draft_excel_frame"
+        signature_key = "draft_excel_signature"
+        revision_key = "draft_excel_revision"
         if not assignments:
+            st.session_state.pop(frame_key, None)
+            st.session_state.pop(signature_key, None)
             st.markdown('<div class="empty">No assignments in this schedule yet.</div>', unsafe_allow_html=True)
             return
         active_crew_names = list(crew_members)
@@ -689,98 +694,107 @@ def assignment_table_editor(state: str, assignments: list[dict]) -> None:
             st.error("Create an active saved crew in Team → Crews before editing the Draft table.")
             return
 
-        changes = []
+        database_frame = pd.DataFrame([{
+            "id": assignment["id"],
+            "work_order_id": assignment["work_order_id"],
+            "title": assignment.get("title", ""),
+            "day": assignment["day"],
+            "crew_label": assignment["crew_label"],
+            "technicians": assignment["technicians"].replace(",", ", "),
+            "hours": float(assignment["hours"]),
+            "status": assignment["status"],
+            "notes": assignment["notes"],
+        } for assignment in assignments])
+        signature = tuple(database_frame["id"].astype(str))
+        if (
+            st.session_state.get(signature_key) != signature
+            or frame_key not in st.session_state
+        ):
+            st.session_state[frame_key] = database_frame
+            st.session_state[signature_key] = signature
+            st.session_state[revision_key] = int(st.session_state.get(revision_key, 0)) + 1
+
+        working_frame = st.session_state[frame_key].copy()
+        excel_crew_options = list(active_crew_names)
+        for crew_name in working_frame["crew_label"].astype(str):
+            if crew_name not in excel_crew_options:
+                excel_crew_options.append(crew_name)
+
         status_options = ["Scheduled", "In Progress", "Deferred", "Complete"]
-        for assignment in assignments:
-            with st.container(border=True):
-                primary = st.columns([1.0, 1.4, 2.1, 1.2])
-                day = primary[0].selectbox(
-                    "Day",
-                    DAYS,
-                    index=safe_index(DAYS, assignment["day"]),
-                    key=f"draft_grid_day_{assignment['id']}",
-                )
-                row_crew_options = list(active_crew_names)
-                if assignment["crew_label"] not in row_crew_options:
-                    row_crew_options.append(assignment["crew_label"])
-                crew_name = primary[1].selectbox(
-                    "Crew",
-                    row_crew_options,
-                    index=safe_index(row_crew_options, assignment["crew_label"]),
-                    key=f"draft_grid_crew_{assignment['id']}",
-                )
-                people = crew_members.get(
-                    crew_name,
-                    [name.strip() for name in assignment["technicians"].split(",") if name.strip()],
-                )
-                primary[2].caption("People in crew")
-                primary[2].markdown(", ".join(people) if people else "_No saved members_")
-                primary[3].caption("Work order")
-                primary[3].markdown(f"**{assignment['work_order_id']}**")
+        edited_draft = st.data_editor(
+            working_frame,
+            key=f"draft_excel_editor_{st.session_state[revision_key]}",
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            height=max(180, min(600, 42 + 36 * len(working_frame))),
+            column_order=[
+                "work_order_id", "title", "day", "crew_label",
+                "technicians", "hours", "status", "notes",
+            ],
+            disabled=["id", "work_order_id", "title", "technicians"],
+            column_config={
+                "work_order_id": st.column_config.TextColumn("Work order", width="medium", pinned=True),
+                "title": st.column_config.TextColumn("Job", width="large"),
+                "day": st.column_config.SelectboxColumn("Day", options=DAYS, required=True, width="medium"),
+                "crew_label": st.column_config.SelectboxColumn("Crew", options=excel_crew_options, required=True, width="medium"),
+                "technicians": st.column_config.TextColumn("People in crew", width="large", disabled=True),
+                "hours": st.column_config.NumberColumn("Hours", min_value=.5, max_value=168.0, step=.5, width="small"),
+                "status": st.column_config.SelectboxColumn("Status", options=status_options, required=True, width="medium"),
+                "notes": st.column_config.TextColumn("Notes", width="large"),
+            },
+        )
 
-                secondary = st.columns([2.5, .8, 1.2, 2.2])
-                secondary[0].caption("Job")
-                secondary[0].markdown(str(assignment.get("title", "")))
-                hours = secondary[1].number_input(
-                    "Hours",
-                    min_value=.5,
-                    max_value=168.0,
-                    step=.5,
-                    value=float(assignment["hours"]),
-                    key=f"draft_grid_hours_{assignment['id']}",
-                )
-                status = secondary[2].selectbox(
-                    "Status",
-                    status_options,
-                    index=safe_index(status_options, assignment["status"]),
-                    key=f"draft_grid_status_{assignment['id']}",
-                )
-                notes = secondary[3].text_input(
-                    "Notes",
-                    value=assignment["notes"],
-                    key=f"draft_grid_notes_{assignment['id']}",
-                )
-                changes.append({
-                    "id": assignment["id"],
-                    "day": day,
-                    "crew_label": crew_name,
-                    "people": people,
-                    "hours": hours,
-                    "status": status,
-                    "notes": notes,
-                })
+        synchronized = edited_draft.copy()
+        synchronized["technicians"] = [
+            ", ".join(crew_members.get(str(crew_name), []))
+            for crew_name in synchronized["crew_label"]
+        ]
+        crew_changed = not edited_draft["crew_label"].astype(str).equals(
+            working_frame["crew_label"].astype(str)
+        )
+        people_changed = not synchronized["technicians"].astype(str).equals(
+            edited_draft["technicians"].astype(str)
+        )
+        if crew_changed or people_changed:
+            st.session_state[frame_key] = synchronized
+            st.session_state[revision_key] += 1
+            st.rerun()
 
-        if st.button("Save draft table", type="primary", use_container_width=True, key="save_draft_grid"):
+        if st.button("Save draft table", type="primary", use_container_width=True, key="save_draft_excel"):
+            records = synchronized.to_dict("records")
             invalid = [
-                change for change in changes
-                if change["crew_label"] not in crew_members or not change["people"]
+                record for record in records
+                if record["crew_label"] not in crew_members
+                or not crew_members.get(record["crew_label"])
             ]
             if invalid:
                 st.error("Every draft job must use an active saved crew that has members.")
                 return
             with connection() as conn:
-                for change in changes:
+                for record in records:
                     conn.execute(
                         """UPDATE assignments
                            SET day=?,crew_label=?,technicians=?,hours=?,status=?,notes=?,updated_at=?
                            WHERE id=? AND state='Draft'""",
                         (
-                            change["day"],
-                            change["crew_label"],
-                            ",".join(change["people"]),
-                            change["hours"],
-                            change["status"],
-                            change["notes"],
+                            record["day"],
+                            record["crew_label"],
+                            ",".join(crew_members[record["crew_label"]]),
+                            record["hours"],
+                            record["status"],
+                            record["notes"],
                             now(),
-                            change["id"],
+                            record["id"],
                         ),
                     )
                     history(
                         conn,
-                        change["id"],
+                        record["id"],
                         "Table updated",
-                        f"Draft crew: {change['crew_label']}",
+                        f"Draft crew: {record['crew_label']}",
                     )
+            st.session_state[frame_key] = synchronized
             flash("Draft table saved with the selected crews and their exact members.")
         return
 
