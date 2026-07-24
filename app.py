@@ -940,6 +940,36 @@ def promote_all() -> int:
         return len(assignments)
 
 
+def clear_final_schedule() -> int:
+    """Remove unfinished Final assignments while preserving completed work."""
+    with connection() as conn:
+        assignments = conn.execute(
+            "SELECT id,work_order_id FROM assignments WHERE state='Final' AND status!='Complete'"
+        ).fetchall()
+        if not assignments:
+            return 0
+
+        stamp = now()
+        affected_work_orders = {assignment["work_order_id"] for assignment in assignments}
+        for assignment in assignments:
+            history(conn, assignment["id"], "Cleared", "Final schedule returned to Pending")
+            conn.execute("DELETE FROM assignments WHERE id=?", (assignment["id"],))
+
+        for work_order_id in affected_work_orders:
+            remaining = conn.execute(
+                "SELECT COUNT(*) FROM assignments WHERE work_order_id=? AND status!='Complete'",
+                (work_order_id,),
+            ).fetchone()[0]
+            if remaining == 0:
+                conn.execute(
+                    """UPDATE work_orders
+                       SET status='Pending',completed_at=NULL,updated_at=?
+                       WHERE id=? AND status='Final Scheduled'""",
+                    (stamp, work_order_id),
+                )
+        return len(assignments)
+
+
 def title(text: str, copy: str) -> None:
     st.markdown('<div class="eyebrow">Operations workspace</div>', unsafe_allow_html=True)
     st.title(text)
@@ -1351,6 +1381,22 @@ elif page == "Planning":
                         conn.execute("UPDATE work_orders SET status='Completed',completed_at=?,updated_at=? WHERE id=?", (now(), now(), assignment["work_order_id"]))
                     history(conn, assignment_id, "Completed")
                 flash("Assignment completed.")
+            st.divider()
+            st.subheader("Clear final schedule")
+            st.warning(
+                "This removes unfinished Final assignments and returns their work orders "
+                "to Pending. Completed work and its history are kept."
+            )
+            confirm_clear_final = st.checkbox(
+                "I understand and want to clear the final schedule",
+                key="confirm_clear_final_schedule",
+            )
+            if st.button(
+                "Clear final schedule",
+                disabled=not confirm_clear_final,
+                key="clear_final_schedule",
+            ):
+                flash(f"{clear_final_schedule()} unfinished final assignment(s) cleared.")
     with board_tab:
         board_state = st.radio("Board state", ["Draft", "Final"], horizontal=True)
         board(board_state)
