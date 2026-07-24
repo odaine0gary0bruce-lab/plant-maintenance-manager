@@ -857,6 +857,7 @@ def skill_match(skill: str, required: str) -> bool:
 
 
 def generate_draft(daily_limit: float, clear_first: bool) -> tuple[int, list[str]]:
+    """Build a draft without using crew size, skills, or capacity as restrictions."""
     created, warnings = 0, []
     stamp = now()
     with connection() as conn:
@@ -875,13 +876,12 @@ def generate_draft(daily_limit: float, clear_first: bool) -> tuple[int, list[str
                 crews.append({"id": row["id"], "name": row["name"], "people": people})
         if not crews:
             return 0, ["Create at least one active crew in Team > Crews before generating the draft schedule."]
-        load: dict[tuple[str, str], float] = {}
-        weekly: dict[str, float] = {}
+        daily_crew_load: dict[tuple[str, str], float] = {}
+        crew_load: dict[str, float] = {}
         for assignment in conn.execute("SELECT * FROM assignments WHERE status!='Complete'").fetchall():
-            for name in assignment["technicians"].split(","):
-                if name:
-                    load[(assignment["day"], name)] = load.get((assignment["day"], name), 0) + assignment["hours"]
-                    weekly[name] = weekly.get(name, 0) + assignment["hours"]
+            crew_name = assignment["crew_label"]
+            daily_crew_load[(assignment["day"], crew_name)] = daily_crew_load.get((assignment["day"], crew_name), 0) + assignment["hours"]
+            crew_load[crew_name] = crew_load.get(crew_name, 0) + assignment["hours"]
         for job in jobs:
             already = conn.execute("SELECT COALESCE(SUM(hours),0) FROM assignments WHERE work_order_id=? AND status!='Complete'", (job["id"],)).fetchone()[0]
             remaining = max(0.0, job["duration_hours"] - already)
@@ -890,43 +890,27 @@ def generate_draft(daily_limit: float, clear_first: bool) -> tuple[int, list[str
             days = [day for day in job["allowed_days"].split(",") if day in DAYS]
             if job["preferred_day"] in days:
                 days = [job["preferred_day"], *[day for day in days if day != job["preferred_day"]]]
-            crew_size = max(job["crew_size"], job["mechanical_needed"] + job["welding_needed"], 1)
-            scheduled = False
-            for day in days:
-                candidates = []
-                for crew in crews:
-                    people = crew["people"]
-                    if len(people) < crew_size:
-                        continue
-                    if sum(skill_match(person["skill"], "Mechanical") for person in people) < job["mechanical_needed"]:
-                        continue
-                    if sum(skill_match(person["skill"], "Welding") for person in people) < job["welding_needed"]:
-                        continue
-                    capacity = min(
-                        min(daily_limit - load.get((day, person["name"]), 0) for person in people),
-                        min(person["weekly_hours"] - weekly.get(person["name"], 0) for person in people),
-                    )
-                    if capacity >= .5:
-                        candidates.append((sum(weekly.get(person["name"], 0) for person in people), crew["name"], capacity, crew))
-                if not candidates:
-                    continue
-                _, _, capacity, selected_crew = min(candidates, key=lambda item: (item[0], item[1]))
+            if days:
+                day = days[0]
+                selected_crew = min(
+                    crews,
+                    key=lambda crew: (
+                        daily_crew_load.get((day, crew["name"]), 0),
+                        crew_load.get(crew["name"], 0),
+                        crew["name"],
+                    ),
+                )
                 names = [person["name"] for person in selected_crew["people"]]
-                hours = min(remaining, capacity)
-                if hours < .5:
-                    continue
+                hours = remaining
                 assignment_id = uid("SA")
                 conn.execute("INSERT INTO assignments VALUES (?,?,?,?,?,?,?,?,?,?,?)", (assignment_id, job["id"], "Draft", day, selected_crew["name"], ",".join(names), hours, "Scheduled", job["notes"], stamp, stamp))
                 history(conn, assignment_id, "Generated", f"{job['id']} assigned to {selected_crew['name']}")
-                for name in names:
-                    load[(day, name)] = load.get((day, name), 0) + hours
-                    weekly[name] = weekly.get(name, 0) + hours
+                daily_crew_load[(day, selected_crew["name"])] = daily_crew_load.get((day, selected_crew["name"]), 0) + hours
+                crew_load[selected_crew["name"]] = crew_load.get(selected_crew["name"], 0) + hours
                 conn.execute("UPDATE work_orders SET status='Draft Scheduled',updated_at=? WHERE id=?", (stamp, job["id"]))
                 created += 1
-                scheduled = True
-                break
-            if not scheduled:
-                warnings.append(f"{job['id']} - {job['title']} could not be assigned to an available crew with the required size, skills and capacity.")
+            else:
+                warnings.append(f"{job['id']} - {job['title']} could not be assigned because it has no allowed scheduling day.")
     return created, warnings
 
 
@@ -1326,11 +1310,11 @@ elif page == "Planning":
         st.caption("Correct readiness, labor, allowed days, duration, and priority here before generating the schedule.")
         job_table_editor(open_jobs, "planning_readiness_table")
     with draft_tab:
-        c1, c2, c3 = st.columns(3)
-        limit = c1.number_input("Daily limit", 4.0, 12.0, 8.0, .5)
-        clear = c2.checkbox("Clear existing draft", True)
-        if c3.button("Generate draft", type="primary", use_container_width=True):
-            count, warnings = generate_draft(limit, clear)
+        st.caption("Crew selection ignores required crew size, skills, and workload capacity.")
+        c1, c2 = st.columns(2)
+        clear = c1.checkbox("Clear existing draft", True)
+        if c2.button("Generate draft", type="primary", use_container_width=True):
+            count, warnings = generate_draft(8, clear)
             st.session_state["warnings"] = warnings
             flash(f"{count} draft assignment(s) generated.")
         for warning in st.session_state.get("warnings", []):
