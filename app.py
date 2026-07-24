@@ -851,13 +851,8 @@ def history(conn: sqlite3.Connection, assignment_id: str, action: str, detail: s
     conn.execute("INSERT INTO schedule_history VALUES (?,?,?,?,?)", (uid("SH"), assignment_id, action, detail, now()))
 
 
-def skill_match(skill: str, required: str) -> bool:
-    value = skill.lower()
-    return required.lower() in value or "multi" in value or "general" in value
-
-
 def generate_draft(daily_limit: float, clear_first: bool) -> tuple[int, list[str]]:
-    """Build a draft without using crew size, skills, or capacity as restrictions."""
+    """Build a draft using only the exact active crews saved by the user."""
     created, warnings = 0, []
     stamp = now()
     with connection() as conn:
@@ -867,10 +862,11 @@ def generate_draft(daily_limit: float, clear_first: bool) -> tuple[int, list[str
         jobs = [dict(row) for row in conn.execute("SELECT * FROM work_orders WHERE status NOT IN ('Completed') AND released=1 ORDER BY priority_score DESC,due_at").fetchall()]
         members = {
             row["id"]: dict(row)
-            for row in conn.execute("SELECT * FROM team_members WHERE active=1 AND availability!='Unavailable'").fetchall()
+            for row in conn.execute("SELECT * FROM team_members").fetchall()
         }
         crews = []
         for row in conn.execute("SELECT * FROM team_crews WHERE active=1 ORDER BY name").fetchall():
+            # Preserve the exact member order and membership saved on the crew.
             people = [members[member_id] for member_id in row["members"].split(",") if member_id in members]
             if people:
                 crews.append({"id": row["id"], "name": row["name"], "people": people})
@@ -1310,7 +1306,10 @@ elif page == "Planning":
         st.caption("Correct readiness, labor, allowed days, duration, and priority here before generating the schedule.")
         job_table_editor(open_jobs, "planning_readiness_table")
     with draft_tab:
-        st.caption("Crew selection ignores required crew size, skills, and workload capacity.")
+        st.caption(
+            "Scheduling uses only the exact active crews you built in Team → Crews. "
+            "It never creates or changes a crew."
+        )
         c1, c2 = st.columns(2)
         clear = c1.checkbox("Clear existing draft", True)
         if c2.button("Generate draft", type="primary", use_container_width=True):
