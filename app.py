@@ -6,8 +6,10 @@ import os
 import re
 import sqlite3
 import uuid
+from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from html import escape
 from pathlib import Path
 
 import pandas as pd
@@ -18,6 +20,17 @@ try:
     EXCEL_SUPPORT = True
 except ModuleNotFoundError:
     EXCEL_SUPPORT = False
+
+try:
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.pagesizes import landscape, letter
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import inch
+    from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    PDF_SUPPORT = True
+except ModuleNotFoundError:
+    PDF_SUPPORT = False
 
 
 # =========================================================
@@ -124,6 +137,10 @@ def initialize_database() -> None:
                 skill TEXT NOT NULL, weekly_hours REAL NOT NULL DEFAULT 40,
                 availability TEXT NOT NULL DEFAULT 'Available', active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS team_crews (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, members TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS assets (
                 id TEXT PRIMARY KEY, asset_number TEXT NOT NULL UNIQUE, asset_name TEXT NOT NULL,
@@ -238,6 +255,43 @@ def save_team(data: dict, member_id: str | None = None) -> None:
                          (member_id, data["name"], data["role"], email, data["skill"], data["hours"], data["availability"], int(data["active"]), stamp, stamp))
 
 
+def save_crew(data: dict, crew_id: str | None = None) -> None:
+    crew_id = crew_id or uid("CR")
+    name = str(data.get("name") or "").strip()
+    members = [str(member_id).strip() for member_id in data.get("members", []) if str(member_id).strip()]
+    if not name:
+        raise ValueError("Crew name is required.")
+    if not members:
+        raise ValueError("Select at least one crew member.")
+    stamp = now()
+    values = (name, ",".join(dict.fromkeys(members)), int(data.get("active", True)), stamp)
+    with connection() as conn:
+        conflicts: list[str] = []
+        for crew in conn.execute("SELECT id,name,members FROM team_crews WHERE id!=?", (crew_id,)).fetchall():
+            if set(members) & {value for value in crew["members"].split(",") if value}:
+                conflicts.append(crew["name"])
+        if conflicts:
+            raise ValueError(
+                "A person can only be in one crew. Remove the selected person from: "
+                + ", ".join(conflicts)
+            )
+        if conn.execute("SELECT 1 FROM team_crews WHERE id=?", (crew_id,)).fetchone():
+            conn.execute(
+                "UPDATE team_crews SET name=?,members=?,active=?,updated_at=? WHERE id=?",
+                (*values, crew_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO team_crews VALUES (?,?,?,?,?,?)",
+                (crew_id, *values[:-1], stamp, stamp),
+            )
+
+
+def delete_crew(crew_id: str) -> None:
+    with connection() as conn:
+        conn.execute("DELETE FROM team_crews WHERE id=?", (crew_id,))
+
+
 def save_asset(data: dict, asset_id: str | None = None) -> None:
     asset_id = asset_id or uid("AS")
     stamp = now()
@@ -300,6 +354,111 @@ def cell_datetime(value) -> str:
         return pd.to_datetime(text).to_pydatetime().replace(microsecond=0).isoformat()
     except Exception:
         return text
+
+
+def build_schedule_pdf(assignments: list[dict], crew_name: str | None = None, report_title: str = "Final Maintenance Schedule") -> bytes:
+    if not PDF_SUPPORT:
+        raise RuntimeError("PDF support is not installed. Add reportlab>=4,<5 to requirements.txt and reboot the app.")
+    normalized = []
+    for row in assignments:
+        normalized.append({
+            "crew": cell_text(row.get("crew_label"), "Unassigned Crew"),
+            "people": cell_text(row.get("technicians")),
+            "day": cell_text(row.get("day")),
+            "work_order": cell_text(row.get("work_order_id")),
+            "job": cell_text(row.get("title")),
+            "location": cell_text(row.get("location")),
+            "hours": cell_float(row.get("hours"), 0),
+            "status": cell_text(row.get("status"), "Scheduled"),
+        })
+    if crew_name:
+        normalized = [row for row in normalized if row["crew"] == crew_name]
+    day_order = {day: index for index, day in enumerate(DAYS)}
+    normalized.sort(key=lambda row: (row["crew"].lower(), day_order.get(row["day"], 99), row["work_order"]))
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for row in normalized:
+        grouped[row["crew"]].append(row)
+
+    output = io.BytesIO()
+    document = SimpleDocTemplate(
+        output, pagesize=landscape(letter), rightMargin=.45 * inch, leftMargin=.45 * inch,
+        topMargin=.45 * inch, bottomMargin=.45 * inch, title=report_title, author="Maintainly",
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "ScheduleTitle", parent=styles["Title"], fontName="Helvetica-Bold", fontSize=20,
+        leading=24, textColor=colors.HexColor("#123a70"), alignment=TA_CENTER, spaceAfter=8,
+    )
+    crew_style = ParagraphStyle(
+        "CrewHeading", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=14,
+        leading=17, textColor=colors.HexColor("#1d4ed8"), spaceBefore=6, spaceAfter=4,
+    )
+    body_style = ParagraphStyle("ScheduleBody", parent=styles["BodyText"], fontName="Helvetica", fontSize=8.5, leading=11)
+    small_style = ParagraphStyle("ScheduleSmall", parent=body_style, textColor=colors.HexColor("#475569"), spaceAfter=8)
+    story = [
+        Paragraph(escape(report_title), title_style),
+        Paragraph(
+            f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} | "
+            f"{len(normalized)} scheduled job{'s' if len(normalized) != 1 else ''}",
+            small_style,
+        ),
+    ]
+    if not grouped:
+        story.append(Paragraph("No final schedule assignments are available.", body_style))
+    for index, (crew, crew_rows) in enumerate(grouped.items()):
+        if index:
+            story.append(PageBreak())
+        people = []
+        for row in crew_rows:
+            for person in [value.strip() for value in row["people"].split(",") if value.strip()]:
+                if person not in people:
+                    people.append(person)
+        story.extend([
+            Paragraph(escape(crew), crew_style),
+            Paragraph(
+                f"<b>Crew size:</b> {len(people)} &nbsp;&nbsp; "
+                f"<b>People:</b> {escape(', '.join(people) or 'No members listed')}",
+                body_style,
+            ),
+            Spacer(1, 8),
+        ])
+        table_data = [[
+            Paragraph("<b>Day</b>", body_style), Paragraph("<b>Work order</b>", body_style),
+            Paragraph("<b>Job</b>", body_style), Paragraph("<b>Location</b>", body_style),
+            Paragraph("<b>Hours</b>", body_style), Paragraph("<b>Status</b>", body_style),
+        ]]
+        for row in crew_rows:
+            table_data.append([
+                Paragraph(escape(row["day"]), body_style), Paragraph(escape(row["work_order"]), body_style),
+                Paragraph(escape(row["job"]), body_style), Paragraph(escape(row["location"]), body_style),
+                Paragraph(f"{row['hours']:.1f}", body_style), Paragraph(escape(row["status"]), body_style),
+            ])
+        table = Table(
+            table_data,
+            colWidths=[.8 * inch, 1.2 * inch, 3.1 * inch, 2.25 * inch, .65 * inch, 1.05 * inch],
+            repeatRows=1,
+        )
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#dbeafe")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#123a70")),
+            ("GRID", (0, 0), (-1, -1), .4, colors.HexColor("#bfcee3")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6), ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+        ]))
+        story.append(table)
+
+    def footer(canvas, doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(colors.HexColor("#64748b"))
+        canvas.drawString(document.leftMargin, .23 * inch, "Maintainly - Crew schedule")
+        canvas.drawRightString(landscape(letter)[0] - document.rightMargin, .23 * inch, f"Page {doc.page}")
+        canvas.restoreState()
+
+    document.build(story, onFirstPage=footer, onLaterPages=footer)
+    return output.getvalue()
 
 
 def job_data_from_row(row: dict) -> dict:
@@ -502,33 +661,55 @@ def job_table_editor(jobs: list[dict], key: str = "jobs_spreadsheet") -> None:
             flash("Work-order table saved. Added, edited and removed jobs are ready for planning.")
 
 def assignment_table_editor(state: str, assignments: list[dict]) -> None:
+    crew_rows = rows("SELECT * FROM team_crews WHERE active=1 ORDER BY name")
+    team_lookup = {member["id"]: member["name"] for member in rows("SELECT id,name FROM team_members")}
+    crew_members = {
+        crew["name"]: [
+            team_lookup[member_id] for member_id in crew["members"].split(",")
+            if member_id in team_lookup
+        ]
+        for crew in crew_rows
+    }
+    crew_options = list(crew_members)
+    for assignment in assignments:
+        if assignment["crew_label"] not in crew_options:
+            crew_options.append(assignment["crew_label"])
     columns = ["id", "day", "crew_label", "work_order_id", "title", "technicians", "hours", "status", "notes"]
     frame = pd.DataFrame(assignments, columns=columns)
+    disabled = ["id", "work_order_id", "title", "technicians"]
+    if state != "Draft":
+        disabled.append("crew_label")
     edited = st.data_editor(
         frame,
         key=f"{state.lower()}_assignment_spreadsheet",
         use_container_width=True,
         hide_index=True,
         num_rows="fixed",
-        disabled=["id", "work_order_id", "title"],
+        disabled=disabled,
         column_config={
             "id": st.column_config.TextColumn("Assignment ID"),
             "day": st.column_config.SelectboxColumn("Day", options=DAYS, required=True),
-            "crew_label": st.column_config.TextColumn("Crew", required=True),
+            "crew_label": st.column_config.SelectboxColumn("Crew", options=crew_options, required=True),
             "work_order_id": st.column_config.TextColumn("Work order"),
             "title": st.column_config.TextColumn("Job"),
-            "technicians": st.column_config.TextColumn("Technicians (comma separated)"),
+            "technicians": st.column_config.TextColumn("People in crew"),
             "hours": st.column_config.NumberColumn("Hours", min_value=.5, max_value=24, step=.5),
             "status": st.column_config.SelectboxColumn("Status", options=["Scheduled", "In Progress", "Deferred", "Complete"]),
             "notes": st.column_config.TextColumn("Notes"),
         },
     )
     if st.button(f"Save {state.lower()} table", type="primary", use_container_width=True, key=f"save_{state.lower()}_table"):
+        records = edited.to_dict("records")
+        if state == "Draft" and any(cell_text(record["crew_label"]) not in crew_members for record in records):
+            st.error("Every draft job must use an active saved crew from Team > Crews.")
+            return
         with connection() as conn:
-            for record in edited.to_dict("records"):
+            for record in records:
+                crew_name = cell_text(record["crew_label"], "Crew")
+                people = crew_members.get(crew_name, [name for name in cell_text(record["technicians"]).split(",") if name])
                 conn.execute(
                     "UPDATE assignments SET day=?,crew_label=?,technicians=?,hours=?,status=?,notes=?,updated_at=? WHERE id=?",
-                    (cell_text(record["day"], "Monday"), cell_text(record["crew_label"], "Crew"), cell_text(record["technicians"]), max(.5, cell_float(record["hours"], 1)), cell_text(record["status"], "Scheduled"), cell_text(record["notes"]), now(), cell_text(record["id"])),
+                    (cell_text(record["day"], "Monday"), crew_name, ",".join(people), max(.5, cell_float(record["hours"], 1)), cell_text(record["status"], "Scheduled"), cell_text(record["notes"]), now(), cell_text(record["id"])),
                 )
                 history(conn, cell_text(record["id"]), "Table updated", f"{state} schedule edited")
         flash(f"{state} assignment table saved.")
@@ -683,12 +864,24 @@ def generate_draft(daily_limit: float, clear_first: bool) -> tuple[int, list[str
             conn.execute("DELETE FROM assignments WHERE state='Draft'")
             conn.execute("UPDATE work_orders SET status='Pending' WHERE status='Draft Scheduled'")
         jobs = [dict(row) for row in conn.execute("SELECT * FROM work_orders WHERE status NOT IN ('Completed') AND released=1 ORDER BY priority_score DESC,due_at").fetchall()]
-        members = [dict(row) for row in conn.execute("SELECT * FROM team_members WHERE active=1 AND availability!='Unavailable'").fetchall()]
+        members = {
+            row["id"]: dict(row)
+            for row in conn.execute("SELECT * FROM team_members WHERE active=1 AND availability!='Unavailable'").fetchall()
+        }
+        crews = []
+        for row in conn.execute("SELECT * FROM team_crews WHERE active=1 ORDER BY name").fetchall():
+            people = [members[member_id] for member_id in row["members"].split(",") if member_id in members]
+            if people:
+                crews.append({"id": row["id"], "name": row["name"], "people": people})
+        if not crews:
+            return 0, ["Create at least one active crew in Team > Crews before generating the draft schedule."]
         load: dict[tuple[str, str], float] = {}
+        weekly: dict[str, float] = {}
         for assignment in conn.execute("SELECT * FROM assignments WHERE status!='Complete'").fetchall():
             for name in assignment["technicians"].split(","):
                 if name:
                     load[(assignment["day"], name)] = load.get((assignment["day"], name), 0) + assignment["hours"]
+                    weekly[name] = weekly.get(name, 0) + assignment["hours"]
         for job in jobs:
             already = conn.execute("SELECT COALESCE(SUM(hours),0) FROM assignments WHERE work_order_id=? AND status!='Complete'", (job["id"],)).fetchone()[0]
             remaining = max(0.0, job["duration_hours"] - already)
@@ -700,32 +893,40 @@ def generate_draft(daily_limit: float, clear_first: bool) -> tuple[int, list[str
             crew_size = max(job["crew_size"], job["mechanical_needed"] + job["welding_needed"], 1)
             scheduled = False
             for day in days:
-                selected: list[dict] = []
-                for required, count in (("Mechanical", job["mechanical_needed"]), ("Welding", job["welding_needed"])):
-                    candidates = [m for m in members if m not in selected and skill_match(m["skill"], required) and load.get((day, m["name"]), 0) < daily_limit]
-                    candidates.sort(key=lambda m: load.get((day, m["name"]), 0))
-                    selected.extend(candidates[:count])
-                remaining_members = [m for m in members if m not in selected and load.get((day, m["name"]), 0) < daily_limit]
-                remaining_members.sort(key=lambda m: load.get((day, m["name"]), 0))
-                selected.extend(remaining_members[:max(0, crew_size - len(selected))])
-                if len(selected) < crew_size:
+                candidates = []
+                for crew in crews:
+                    people = crew["people"]
+                    if len(people) < crew_size:
+                        continue
+                    if sum(skill_match(person["skill"], "Mechanical") for person in people) < job["mechanical_needed"]:
+                        continue
+                    if sum(skill_match(person["skill"], "Welding") for person in people) < job["welding_needed"]:
+                        continue
+                    capacity = min(
+                        min(daily_limit - load.get((day, person["name"]), 0) for person in people),
+                        min(person["weekly_hours"] - weekly.get(person["name"], 0) for person in people),
+                    )
+                    if capacity >= .5:
+                        candidates.append((sum(weekly.get(person["name"], 0) for person in people), crew["name"], capacity, crew))
+                if not candidates:
                     continue
-                names = [m["name"] for m in selected]
-                hours = min(remaining, min(daily_limit - load.get((day, name), 0) for name in names))
+                _, _, capacity, selected_crew = min(candidates, key=lambda item: (item[0], item[1]))
+                names = [person["name"] for person in selected_crew["people"]]
+                hours = min(remaining, capacity)
                 if hours < .5:
                     continue
                 assignment_id = uid("SA")
-                crew_count = conn.execute("SELECT COUNT(*) FROM assignments WHERE day=?", (day,)).fetchone()[0] + 1
-                conn.execute("INSERT INTO assignments VALUES (?,?,?,?,?,?,?,?,?,?,?)", (assignment_id, job["id"], "Draft", day, f"{day[:3]} Crew {crew_count}", ",".join(names), hours, "Scheduled", job["notes"], stamp, stamp))
-                history(conn, assignment_id, "Generated", f"{job['id']} assigned to {', '.join(names)}")
+                conn.execute("INSERT INTO assignments VALUES (?,?,?,?,?,?,?,?,?,?,?)", (assignment_id, job["id"], "Draft", day, selected_crew["name"], ",".join(names), hours, "Scheduled", job["notes"], stamp, stamp))
+                history(conn, assignment_id, "Generated", f"{job['id']} assigned to {selected_crew['name']}")
                 for name in names:
                     load[(day, name)] = load.get((day, name), 0) + hours
+                    weekly[name] = weekly.get(name, 0) + hours
                 conn.execute("UPDATE work_orders SET status='Draft Scheduled',updated_at=? WHERE id=?", (stamp, job["id"]))
                 created += 1
                 scheduled = True
                 break
             if not scheduled:
-                warnings.append(f"{job['id']} - {job['title']} could not be scheduled with current skills and capacity.")
+                warnings.append(f"{job['id']} - {job['title']} could not be assigned to an available crew with the required size, skills and capacity.")
     return created, warnings
 
 
@@ -759,6 +960,28 @@ def team_form(prefix: str, member: dict | None = None) -> tuple[bool, dict]:
         active = st.checkbox("Active", bool(member.get("active", 1)))
         submitted = st.form_submit_button("Save team member", type="primary", use_container_width=True)
     return submitted, {"name":name.strip(), "role":role.strip(), "email":email.strip(), "skill":skill, "availability":availability, "hours":hours, "active":active}
+
+
+def crew_form(prefix: str, team: list[dict], crew: dict | None = None) -> tuple[bool, dict]:
+    crew = crew or {}
+    member_ids = [member["id"] for member in team]
+    labels = {member["id"]: f"{member['name']} - {member['skill']}" for member in team}
+    selected = [
+        member_id for member_id in str(crew.get("members") or "").split(",")
+        if member_id in labels
+    ]
+    with st.form(f"{prefix}_crew"):
+        name = st.text_input("Crew name", crew.get("name", ""))
+        members = st.multiselect(
+            "Who is in this crew?",
+            member_ids,
+            default=selected,
+            format_func=lambda member_id: labels.get(member_id, member_id),
+        )
+        st.info(f"Crew size: {len(members)} person{'s' if len(members) != 1 else ''}")
+        active = st.checkbox("Active crew", bool(crew.get("active", 1)))
+        submitted = st.form_submit_button("Save crew", type="primary", use_container_width=True)
+    return submitted, {"name": name.strip(), "members": members, "active": active}
 
 
 def asset_form(prefix: str, asset: dict | None = None) -> tuple[bool, dict]:
@@ -875,12 +1098,14 @@ if page == "Schedule":
 elif page == "Team":
     title("Team", "Add, edit and remove team members and manage weekly capacity.")
     team = rows("SELECT * FROM team_members ORDER BY name")
-    c1, c2, c3 = st.columns(3)
+    crews = rows("SELECT * FROM team_crews ORDER BY name")
+    c1, c2, c3, c4 = st.columns(4)
     active = [m for m in team if m["active"]]
     c1.metric("Active members", len(active))
     c2.metric("Weekly capacity", f"{sum(m['weekly_hours'] for m in active):.0f}h")
     c3.metric("Skills covered", len({m["skill"] for m in active}))
-    roster, add, edit = st.tabs(["Table editor", "Add member", "Edit / delete"])
+    c4.metric("Saved crews", len(crews))
+    roster, add, edit, crew_tab = st.tabs(["Team table", "Add member", "Edit / delete", "Crews"])
     with roster:
         st.caption("Edit the team directly in the table, then select Save team table.")
         team_table_editor(team)
@@ -909,8 +1134,61 @@ elif page == "Team":
                     st.error("That email address is already in use. Leave it blank if the member has no email.")
             if st.button("Delete selected team member"):
                 with connection() as conn:
+                    for crew in conn.execute("SELECT id,members FROM team_crews").fetchall():
+                        remaining = [value for value in crew["members"].split(",") if value and value != member_id]
+                        if remaining:
+                            conn.execute(
+                                "UPDATE team_crews SET members=?,updated_at=? WHERE id=?",
+                                (",".join(remaining), now(), crew["id"]),
+                            )
+                        else:
+                            conn.execute("DELETE FROM team_crews WHERE id=?", (crew["id"],))
                     conn.execute("DELETE FROM team_members WHERE id=?", (member_id,))
                 flash("Team member deleted.")
+    with crew_tab:
+        member_lookup = {member["id"]: member["name"] for member in team}
+        display = []
+        for crew in crews:
+            member_ids = [value for value in crew["members"].split(",") if value]
+            display.append({
+                "Crew": crew["name"],
+                "Persons": len(member_ids),
+                "Members": ", ".join(member_lookup.get(member_id, "Removed member") for member_id in member_ids),
+                "Active": bool(crew["active"]),
+            })
+        if display:
+            st.dataframe(pd.DataFrame(display), use_container_width=True, hide_index=True)
+        else:
+            st.info("No crews saved yet.")
+        create_crew, manage_crew = st.tabs(["Create crew", "Edit / delete crew"])
+        with create_crew:
+            if not team:
+                st.info("Add team members before creating a crew.")
+            else:
+                submitted, data = crew_form("new", team)
+                if submitted:
+                    try:
+                        save_crew(data)
+                        flash(f"{data['name']} crew saved with {len(data['members'])} person(s).")
+                    except (ValueError, sqlite3.IntegrityError) as exc:
+                        st.error("That crew name already exists." if isinstance(exc, sqlite3.IntegrityError) else str(exc))
+        with manage_crew:
+            if not crews:
+                st.info("Create a crew first.")
+            else:
+                crew_labels = {crew["id"]: f"{crew['name']} ({len([value for value in crew['members'].split(',') if value])} persons)" for crew in crews}
+                crew_id = st.selectbox("Select crew", list(crew_labels), format_func=crew_labels.get)
+                selected_crew = next(crew for crew in crews if crew["id"] == crew_id)
+                submitted, data = crew_form(f"edit_{crew_id}", team, selected_crew)
+                if submitted:
+                    try:
+                        save_crew(data, crew_id)
+                        flash(f"{data['name']} crew updated.")
+                    except (ValueError, sqlite3.IntegrityError) as exc:
+                        st.error("That crew name already exists." if isinstance(exc, sqlite3.IntegrityError) else str(exc))
+                if st.button("Delete selected crew"):
+                    delete_crew(crew_id)
+                    flash("Crew deleted.")
 
 elif page == "Assets":
     title("Assets", "Track asset health, criticality and service history.")
@@ -1037,9 +1315,31 @@ elif page == "Planning":
                 conn.execute("UPDATE work_orders SET status='Pending' WHERE status='Draft Scheduled'")
             flash("Draft schedule cleared.")
     with final_tab:
-        st.caption("Edit the committed schedule directly in the table, then save your changes.")
+        st.caption("The final schedule is locked to saved crews. Download the complete schedule or one PDF per crew.")
         assignment_table_editor("Final", final)
         if final:
+            if PDF_SUPPORT:
+                st.subheader("Download final crew schedules")
+                st.download_button(
+                    "Download complete final schedule PDF",
+                    data=build_schedule_pdf(final),
+                    file_name="maintainly-final-schedule.pdf",
+                    mime="application/pdf",
+                    type="primary",
+                    use_container_width=True,
+                )
+                for crew_name in sorted({assignment["crew_label"] for assignment in final}):
+                    safe_name = "".join(character if character.isalnum() else "-" for character in crew_name).strip("-").lower() or "crew"
+                    st.download_button(
+                        f"Download {crew_name} PDF",
+                        data=build_schedule_pdf(final, crew_name, f"{crew_name} - Final Schedule"),
+                        file_name=f"{safe_name}-final-schedule.pdf",
+                        mime="application/pdf",
+                        key=f"download_{safe_name}_final_pdf",
+                        use_container_width=True,
+                    )
+            else:
+                st.warning("PDF support is not installed. Add reportlab>=4,<5 to requirements.txt and reboot the app.")
             labels = {a["id"]: f"{a['day']} - {a['crew_label']} - {a['work_order_id']}" for a in final}
             assignment_id = st.selectbox("Select final assignment", list(labels), format_func=labels.get)
             if st.button("Complete selected assignment", type="primary"):
