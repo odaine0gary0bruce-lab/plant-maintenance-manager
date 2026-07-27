@@ -350,15 +350,18 @@ def cell_bool(value, default: bool = True) -> bool:
 
 
 def cell_datetime(value) -> str:
+    fallback = (datetime.now() + timedelta(days=2)).replace(
+        hour=8, minute=0, second=0, microsecond=0
+    ).isoformat()
     if value is None or (not isinstance(value, (list, tuple, dict)) and pd.isna(value)):
-        return (datetime.now() + timedelta(days=2)).replace(hour=8, minute=0, second=0, microsecond=0).isoformat()
+        return fallback
     if isinstance(value, (datetime, pd.Timestamp)):
         return value.to_pydatetime().replace(microsecond=0).isoformat() if isinstance(value, pd.Timestamp) else value.replace(microsecond=0).isoformat()
     text = str(value).strip()
     try:
         return pd.to_datetime(text).to_pydatetime().replace(microsecond=0).isoformat()
     except Exception:
-        return text
+        return fallback
 
 
 def build_schedule_pdf(assignments: list[dict], crew_name: str | None = None, report_title: str = "Final Maintenance Schedule") -> bytes:
@@ -579,11 +582,11 @@ def asset_table_editor(assets: list[dict]) -> None:
                 st.error(f"The asset table could not be saved: {exc}")
 
 
-def job_column_config() -> dict:
+def job_column_config(required_identifiers: bool = True) -> dict:
     return {
         "_original_id": None,
-        "id": st.column_config.TextColumn("Work order number", required=True),
-        "title": st.column_config.TextColumn("Job", required=True),
+        "id": st.column_config.TextColumn("Work order number", required=required_identifiers),
+        "title": st.column_config.TextColumn("Job", required=required_identifiers),
         "asset": st.column_config.TextColumn("Asset"),
         "location": st.column_config.TextColumn("Location"),
         "department": st.column_config.TextColumn("Department"),
@@ -841,9 +844,14 @@ def assignment_table_editor(state: str, assignments: list[dict]) -> None:
 
 def normalize_imported_jobs(source: pd.DataFrame) -> pd.DataFrame:
     aliases = {
-        "work_order": "id", "work_order_number": "id", "work_order_no": "id", "wo": "id", "job_id": "id",
-        "job": "title", "job_name": "title", "description": "title", "task": "title",
+        "work_order": "id", "work_order_number": "id", "work_order_no": "id",
+        "work_order_id": "id", "workorder": "id", "wo": "id", "wo_number": "id",
+        "order_number": "id", "job_id": "id",
+        "job": "title", "job_name": "title", "job_description": "title",
+        "work_description": "title", "description": "title", "summary": "title",
+        "task": "title", "name": "title",
         "asset_number": "asset", "equipment": "asset", "equipment_number": "asset",
+        "site": "location", "area": "location",
         "due": "due_at", "due_date": "due_at", "date_due": "due_at",
         "duration": "duration_hours", "estimated_hours": "duration_hours", "job_hours": "duration_hours",
         "crew": "crew_size", "crew_required": "crew_size", "crew_size_required": "crew_size",
@@ -852,11 +860,31 @@ def normalize_imported_jobs(source: pd.DataFrame) -> pd.DataFrame:
         "priority_class": "priority", "score": "priority_score",
         "ready_to_schedule": "released", "release_to_scheduler": "released",
     }
-    renamed: dict[str, str] = {}
-    for column in source.columns:
-        normalized = re.sub(r"[^a-z0-9]+", "_", str(column).strip().lower()).strip("_")
-        renamed[column] = aliases.get(normalized, normalized)
-    frame = source.rename(columns=renamed).copy()
+    if not isinstance(source, pd.DataFrame):
+        return pd.DataFrame(columns=JOB_TABLE_COLUMNS)
+    original = source.dropna(how="all").reset_index(drop=True).copy()
+    if original.empty:
+        return pd.DataFrame(columns=JOB_TABLE_COLUMNS)
+
+    recognized = set(JOB_TABLE_COLUMNS)
+    normalized_data: dict[str, pd.Series] = {}
+    extra_columns: list[tuple[str, pd.Series]] = []
+    for position, column in enumerate(original.columns):
+        normalized_name = re.sub(
+            r"[^a-z0-9]+", "_", str(column).strip().lower()
+        ).strip("_")
+        target = aliases.get(normalized_name, normalized_name)
+        values = original.iloc[:, position]
+        if target in recognized:
+            if target in normalized_data:
+                current = normalized_data[target]
+                has_value = current.map(lambda value: bool(cell_text(value)))
+                normalized_data[target] = current.where(has_value, values)
+            else:
+                normalized_data[target] = values.copy()
+        else:
+            extra_columns.append((str(column), values.copy()))
+
     defaults = {
         "id": "", "title": "", "asset": "UNASSIGNED", "location": "Plant", "department": "Operations",
         "due_at": (datetime.now() + timedelta(days=2)).replace(hour=8, minute=0, second=0, microsecond=0).isoformat(),
@@ -865,16 +893,90 @@ def normalize_imported_jobs(source: pd.DataFrame) -> pd.DataFrame:
         "allowed_days": ",".join(DAYS[:5]), "preferred_day": "", "scope_ready": True, "parts_ready": True,
         "permits_ready": True, "shutdown_ready": True, "released": True, "notes": "",
     }
+    frame = pd.DataFrame(index=original.index)
     for column, default in defaults.items():
-        if column not in frame.columns:
-            frame[column] = default
+        frame[column] = normalized_data.get(
+            column,
+            pd.Series([default] * len(original), index=original.index),
+        )
+
+    import_token = uuid.uuid4().hex[:6].upper()
+    used_ids: set[str] = set()
+    normalized_ids: list[str] = []
+    for position, value in enumerate(frame["id"], start=1):
+        candidate = cell_text(value) or f"IMPORT-{import_token}-{position:03d}"
+        base = candidate
+        duplicate_number = 2
+        while candidate in used_ids:
+            candidate = f"{base}-{duplicate_number}"
+            duplicate_number += 1
+        used_ids.add(candidate)
+        normalized_ids.append(candidate)
+    frame["id"] = normalized_ids
+    frame["title"] = [
+        cell_text(value) or f"Imported job {position}"
+        for position, value in enumerate(frame["title"], start=1)
+    ]
+
+    text_defaults = {
+        "asset": "UNASSIGNED",
+        "location": "Plant",
+        "department": "Operations",
+        "category": "General",
+    }
+    for column, default in text_defaults.items():
+        frame[column] = frame[column].map(lambda value, fallback=default: cell_text(value) or fallback)
+
+    notes: list[str] = []
+    for row_index, value in enumerate(frame["notes"]):
+        parts = []
+        for column_name, column_values in extra_columns:
+            extra_value = cell_text(column_values.iloc[row_index])
+            if extra_value:
+                parts.append(f"{column_name}: {extra_value}")
+        existing_note = cell_text(value)
+        extras_note = f"Imported extra columns: {'; '.join(parts)}" if parts else ""
+        notes.append("\n".join(part for part in (existing_note, extras_note) if part))
+    frame["notes"] = notes
+
     frame = frame[JOB_TABLE_COLUMNS]
     for column in ["scope_ready", "parts_ready", "permits_ready", "shutdown_ready", "released"]:
         frame[column] = frame[column].map(lambda value: cell_bool(value, True))
-    for column, default in [("duration_hours", 1.0), ("priority_score", 7), ("crew_size", 1), ("mechanical_needed", 0), ("welding_needed", 0)]:
-        frame[column] = frame[column].map(lambda value, fallback=default: cell_float(value, fallback))
+    frame["duration_hours"] = frame["duration_hours"].map(
+        lambda value: max(.5, cell_float(value, 1))
+    )
+    frame["priority_score"] = frame["priority_score"].map(
+        lambda value: max(1, min(20, cell_int(value, 7)))
+    )
+    frame["crew_size"] = frame["crew_size"].map(
+        lambda value: max(1, cell_int(value, 1))
+    )
+    for column in ["mechanical_needed", "welding_needed"]:
+        frame[column] = frame[column].map(
+            lambda value: max(0, cell_int(value, 0))
+        )
     frame["due_at"] = frame["due_at"].map(cell_datetime)
-    frame["id"] = frame["id"].map(lambda value: cell_text(value))
+    priority_lookup = {value.lower(): value for value in PRIORITIES}
+    status_lookup = {value.lower(): value for value in JOB_STATUSES}
+    frame["priority"] = frame["priority"].map(
+        lambda value: priority_lookup.get(cell_text(value).lower(), "Medium")
+    )
+    frame["status"] = frame["status"].map(
+        lambda value: status_lookup.get(cell_text(value).lower(), "Pending")
+    )
+    frame["preferred_day"] = frame["preferred_day"].map(
+        lambda value: cell_text(value).title()
+        if cell_text(value).title() in DAYS else ""
+    )
+    frame["allowed_days"] = frame["allowed_days"].map(
+        lambda value: ",".join(
+            day for day in (
+                part.strip().title()
+                for part in cell_text(value).replace(";", ",").split(",")
+            )
+            if day in DAYS
+        ) or ",".join(DAYS[:5])
+    )
     return frame
 
 
@@ -902,7 +1004,10 @@ def job_template_excel() -> bytes | None:
 
 def excel_import_workspace(key_prefix: str) -> None:
     st.subheader("Import jobs from Excel")
-    st.caption("Upload an .xlsx file, review every planning field in the table, then save the jobs to the backlog.")
+    st.caption(
+        "Upload any .xlsx or CSV job list. Missing columns and blank values are "
+        "filled with editable temporary defaults instead of blocking the import."
+    )
     template_bytes = job_template_excel()
     if template_bytes is not None:
         st.download_button(
@@ -932,25 +1037,25 @@ def excel_import_workspace(key_prefix: str) -> None:
             st.error(f"The workbook could not be read: {exc}")
     imported = st.session_state.get(f"{key_prefix}_frame")
     if isinstance(imported, pd.DataFrame):
-        st.info("Edit any missing or incorrect scheduling fields below. Work order number and Job are required.")
+        st.info(
+            "Nothing is required before import. Temporary IMPORT numbers and "
+            "Imported job names can be edited now or later in Work orders."
+        )
         reviewed = st.data_editor(
             imported,
             key=f"{key_prefix}_review_{st.session_state.get(f'{key_prefix}_batch', 'current')}",
             use_container_width=True,
             hide_index=True,
             num_rows="dynamic",
-            column_config=job_column_config(),
+            column_config=job_column_config(required_identifiers=False),
             height=520,
         )
         c1, c2 = st.columns(2)
         if c1.button("Save reviewed jobs", type="primary", use_container_width=True, key=f"{key_prefix}_commit"):
-            records = reviewed.to_dict("records")
+            prepared = normalize_imported_jobs(reviewed)
+            records = prepared.to_dict("records")
             if not records:
                 st.error("The import table is empty.")
-            elif any(not cell_text(record.get("id")) for record in records):
-                st.error("Every imported job needs your Work order number.")
-            elif any(not cell_text(record.get("title")) for record in records):
-                st.error("Every imported job needs a Job value.")
             else:
                 created = updated = 0
                 existing_ids = {job["id"] for job in rows("SELECT id FROM work_orders")}
